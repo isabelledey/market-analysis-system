@@ -1,58 +1,24 @@
-"""High-level stock analysis model built on rule-based pattern detection."""
+"""High-level 15-minute stock analysis model built on rule-based detection."""
 
 from __future__ import annotations
 
 from typing import Any
+from typing import Optional
 
 from data_loader import load_stock_data
 from features import add_features
-from pattern_detector import classify_trend
+from pattern_detector import PATTERN_DETAILS
+from pattern_detector import classify_intraday_trend
 from pattern_detector import detect_bearish_engulfing
 from pattern_detector import detect_breakdown
 from pattern_detector import detect_breakout
 from pattern_detector import detect_bullish_engulfing
 from pattern_detector import detect_bullish_pin_bar
-from pattern_detector import detect_double_bottom
-from pattern_detector import detect_double_top
 from pattern_detector import detect_inside_bar
-from pattern_detector import detect_inside_day_failure
+from pattern_detector import detect_inside_bar_failure
 from pattern_detector import detect_shooting_star
+from pattern_detector import resolve_pattern_conflicts
 
-
-RECENCY_WEIGHTS = {
-    0: 1.00,
-    1: 0.85,
-    2: 0.70,
-    3: 0.55,
-    4: 0.40,
-}
-
-PATTERN_SCORES = {
-    "Bullish_Engulfing": 18,
-    "Bearish_Engulfing": -18,
-    "Bullish_Pin_Bar": 14,
-    "Shooting_Star": -14,
-    "Inside_Day_Failure_Bullish": 10,
-    "Inside_Day_Failure_Bearish": -10,
-    "Breakout": 20,
-    "Breakdown": -20,
-    "Double_Bottom": 22,
-    "Double_Top": -22,
-}
-
-PATTERN_LABELS = {
-    "Bullish_Engulfing": "Bullish Engulfing",
-    "Bearish_Engulfing": "Bearish Engulfing",
-    "Bullish_Pin_Bar": "Bullish Pin Bar",
-    "Shooting_Star": "Shooting Star",
-    "Inside_Bar": "Inside Bar",
-    "Inside_Day_Failure_Bullish": "Inside Day Failure Bullish Reversal",
-    "Inside_Day_Failure_Bearish": "Inside Day Failure Bearish Reversal",
-    "Breakout": "20-Day Breakout",
-    "Breakdown": "20-Day Breakdown",
-    "Double_Bottom": "Double Bottom",
-    "Double_Top": "Double Top",
-}
 
 TREND_SCORES = {
     "Uptrend": 15,
@@ -60,11 +26,22 @@ TREND_SCORES = {
     "Neutral": 0,
 }
 
-MAX_NORMALIZED_SCORE = 70.0
+LOOKBACK_BARS = 12
+
+
+def _get_recency_weight(candles_ago: int) -> float:
+    """Weight newer 15-minute bars more heavily than older ones."""
+    if candles_ago == 0:
+        return 1.0
+    if 1 <= candles_ago <= 3:
+        return 0.85
+    if 4 <= candles_ago <= 6:
+        return 0.65
+    return 0.40
 
 
 def _run_pattern_pipeline(symbol: str):
-    """Load the raw data and run all transformations in order."""
+    """Load the raw intraday data and run all transformations in order."""
     df = load_stock_data(symbol=symbol)
     df = add_features(df)
     df = detect_bullish_engulfing(df)
@@ -72,87 +49,246 @@ def _run_pattern_pipeline(symbol: str):
     df = detect_bullish_pin_bar(df)
     df = detect_shooting_star(df)
     df = detect_inside_bar(df)
-    df = detect_inside_day_failure(df)
+    df = detect_inside_bar_failure(df)
     df = detect_breakout(df)
     df = detect_breakdown(df)
-    df = detect_double_bottom(df)
-    df = detect_double_top(df)
-    df = classify_trend(df)
+    df = classify_intraday_trend(df)
     return df
 
 
-def _collect_recent_patterns(df, lookback_days: int = 5) -> tuple[list[dict[str, Any]], float]:
-    """Collect recent pattern hits and convert them into a weighted score."""
-    recent_df = df.tail(lookback_days).copy()
+def _collect_recent_patterns(
+    df,
+    lookback_bars: int = LOOKBACK_BARS,
+) -> list[dict[str, Any]]:
+    """Collect recent pattern hits before same-candle conflict resolution."""
+    recent_df = df.tail(lookback_bars).copy()
     recent_patterns: list[dict[str, Any]] = []
-    total_score = 0.0
 
     for offset, (_, row) in enumerate(recent_df.iloc[::-1].iterrows()):
-        recency_weight = RECENCY_WEIGHTS.get(offset, 0.25)
-        signal_date = row["Date"].date().isoformat()
+        recency_weight = _get_recency_weight(offset)
+        signal_datetime = row["Datetime"].isoformat()
+        range_strength = row.get("Range_Strength")
+        volume_strength = row.get("Volume_Strength")
+        if range_strength is None or range_strength != range_strength:
+            range_strength = 0.0
+        if volume_strength is None or volume_strength != volume_strength:
+            volume_strength = 0.0
+        signal_strength = max(
+            float(range_strength),
+            float(volume_strength),
+        )
 
-        if bool(row.get("Inside_Bar", False)):
-            recent_patterns.append(
-                {
-                    "pattern": PATTERN_LABELS["Inside_Bar"],
-                    "date": signal_date,
-                    "signal": "Neutral",
-                    "weighted_score": 0.0,
-                }
-            )
-
-        for column_name, base_score in PATTERN_SCORES.items():
+        for column_name, metadata in PATTERN_DETAILS.items():
             if bool(row.get(column_name, False)):
-                weighted_score = round(base_score * recency_weight, 2)
-                total_score += weighted_score
+                weighted_score = round(metadata["base_score"] * recency_weight, 2)
                 recent_patterns.append(
                     {
-                        "pattern": PATTERN_LABELS[column_name],
-                        "date": signal_date,
-                        "signal": "Bullish" if base_score > 0 else "Bearish",
+                        "pattern_column": column_name,
+                        "pattern": metadata["label"],
+                        "datetime": signal_datetime,
+                        "signal": metadata["bias"],
+                        "candles_ago": offset,
+                        "priority": metadata["priority"],
+                        "base_score": metadata["base_score"],
+                        "family": metadata["family"],
                         "weighted_score": weighted_score,
+                        "signal_strength": round(signal_strength, 2),
+                        "volume_confirmed": bool(row.get("Volume_Strength", 0) >= 1.0),
+                        "strong_signal": bool(
+                            row.get("Strong_Volume", False)
+                            or row.get("Strong_Range", False)
+                            or column_name.startswith("Strong_")
+                        ),
                     }
                 )
 
-    return recent_patterns, total_score
+    return recent_patterns
+
+
+def _score_patterns(
+    resolved_patterns: list[dict[str, Any]],
+    trend: str,
+) -> dict[str, float]:
+    """Separate bullish, bearish, and total scores with a small trend contribution."""
+    bullish_score = sum(
+        pattern["weighted_score"]
+        for pattern in resolved_patterns
+        if pattern["signal"] == "Bullish"
+    )
+    bearish_score = sum(
+        abs(pattern["weighted_score"])
+        for pattern in resolved_patterns
+        if pattern["signal"] == "Bearish"
+    )
+    neutral_patterns_count = sum(
+        1 for pattern in resolved_patterns if pattern["signal"] == "Neutral"
+    )
+
+    trend_adjustment = TREND_SCORES.get(trend, 0)
+    if trend_adjustment > 0:
+        bullish_score += trend_adjustment
+    elif trend_adjustment < 0:
+        bearish_score += abs(trend_adjustment)
+
+    total_score = bullish_score - bearish_score
+    return {
+        "bullish_score": round(bullish_score, 2),
+        "bearish_score": round(bearish_score, 2),
+        "neutral_patterns_count": neutral_patterns_count,
+        "total_score": round(total_score, 2),
+    }
+
+
+def classify_market_state(
+    df,
+    detected_patterns: list[dict[str, Any]],
+    score: dict[str, float],
+) -> str:
+    """Classify the current intraday market state from trend and recent signals."""
+    latest_trend = str(df.iloc[-1]["Trend"])
+    total_score = score["total_score"]
+    bullish_score = score["bullish_score"]
+    bearish_score = score["bearish_score"]
+    latest_pattern = detected_patterns[0] if detected_patterns else None
+
+    if latest_pattern and latest_pattern["pattern_column"] in {"Strong_Breakout", "Breakout"}:
+        return "Breakout Attempt"
+
+    if latest_pattern and latest_pattern["pattern_column"] in {"Strong_Breakdown", "Breakdown"}:
+        return "Breakdown Attempt"
+
+    if abs(total_score) <= 8 and bullish_score > 0 and bearish_score > 0:
+        return "Choppy"
+
+    if latest_trend == "Uptrend" and bearish_score > bullish_score:
+        if any(
+            pattern["signal"] == "Bearish" and pattern["strong_signal"]
+            for pattern in detected_patterns[:3]
+        ):
+            return "Reversal Attempt"
+
+    if latest_trend == "Downtrend" and bullish_score > bearish_score:
+        if any(
+            pattern["signal"] == "Bullish" and pattern["strong_signal"]
+            for pattern in detected_patterns[:3]
+        ):
+            return "Reversal Attempt"
+
+    if latest_trend == "Uptrend" and bullish_score > bearish_score:
+        return "Trending Bullish"
+
+    if latest_trend == "Downtrend" and bearish_score > bullish_score:
+        return "Trending Bearish"
+
+    return "Neutral"
+
+
+def _calculate_confidence(
+    trend: str,
+    market_state: str,
+    latest_pattern: Optional[dict[str, Any]],
+    top_patterns: list[dict[str, Any]],
+    bullish_score: float,
+    bearish_score: float,
+    total_score: float,
+) -> float:
+    """Estimate confidence from score separation, trend alignment, and signal quality."""
+    score_sum = bullish_score + bearish_score
+    score_balance = abs(bullish_score - bearish_score) / score_sum if score_sum else 0.0
+    confidence = min(55.0, abs(total_score) * 1.8) + (score_balance * 20.0)
+
+    if market_state == "Choppy":
+        confidence -= 25.0
+
+    if trend == "Neutral" and market_state not in {"Breakout Attempt", "Breakdown Attempt"}:
+        confidence -= 10.0
+
+    if latest_pattern:
+        dominant_bias_count = sum(
+            1
+            for pattern in top_patterns
+            if pattern["signal"] == latest_pattern["signal"]
+            and pattern["signal"] != "Neutral"
+        )
+
+        if latest_pattern["strong_signal"]:
+            confidence += 10.0
+
+        if latest_pattern["volume_confirmed"]:
+            confidence += 5.0
+
+        if dominant_bias_count >= 2:
+            confidence += 8.0
+
+        if (
+            (trend == "Uptrend" and latest_pattern["signal"] == "Bullish")
+            or (trend == "Downtrend" and latest_pattern["signal"] == "Bearish")
+        ):
+            confidence += 10.0
+
+    if abs(bullish_score - bearish_score) <= 6:
+        confidence -= 12.0
+
+    if market_state == "Neutral" and not top_patterns:
+        confidence = min(confidence, 20.0)
+
+    return round(max(5.0, min(100.0, confidence)), 1)
 
 
 def _build_explanation(
     symbol: str,
-    latest_date: str,
+    latest_datetime: str,
     latest_close: float,
+    interval: str,
     trend: str,
-    detected_patterns: list[dict[str, Any]],
+    market_state: str,
+    top_patterns: list[dict[str, Any]],
     overall_bias: str,
     confidence_score: float,
-    raw_score: float,
+    bullish_score: float,
+    bearish_score: float,
+    total_score: float,
+    ignored_patterns_count: int,
 ) -> str:
     """Create a short human-readable explanation of the current signal."""
-    if detected_patterns:
+    if top_patterns:
         pattern_names = ", ".join(
-            f"{item['pattern']} ({item['date']})" for item in detected_patterns
+            f"{item['pattern']} ({item['datetime']})" for item in top_patterns
         )
-        pattern_summary = f"Recent pattern activity: {pattern_names}."
+        pattern_summary = f"Top recent patterns: {pattern_names}."
     else:
-        pattern_summary = "No active chart or candlestick patterns were detected in the last 5 trading days."
+        pattern_summary = "No meaningful intraday patterns survived the recent filtering window."
 
     return (
-        f"{symbol} closed at {latest_close:.2f} on {latest_date}. "
-        f"The current trend classification is {trend}. "
+        f"{symbol} last traded at {latest_close:.2f} on {latest_datetime} using {interval} candles. "
+        f"The current intraday trend is {trend} and the market state is {market_state}. "
         f"{pattern_summary} "
-        f"The weighted rule-based score is {raw_score:.2f}, which maps to a {overall_bias.lower()} bias "
-        f"with confidence {confidence_score:.1f}/100."
+        f"Bullish score is {bullish_score:.2f}, bearish score is {bearish_score:.2f}, "
+        f"and total score is {total_score:.2f}. "
+        f"{ignored_patterns_count} lower-priority conflicting patterns were ignored. "
+        f"This maps to a {overall_bias.lower()} bias with confidence {confidence_score:.1f}/100."
     )
 
 
 def analyze_stock(symbol: str) -> dict[str, Any]:
-    """Analyze one symbol and return a structured summary."""
+    """Analyze one symbol using 15-minute intraday candles."""
     df = _run_pattern_pipeline(symbol)
 
     latest_row = df.iloc[-1]
     trend = str(latest_row["Trend"])
-    detected_patterns, pattern_score = _collect_recent_patterns(df, lookback_days=5)
-    total_score = pattern_score + TREND_SCORES.get(trend, 0)
+    interval = "15m"
+    raw_patterns = _collect_recent_patterns(df, lookback_bars=LOOKBACK_BARS)
+    resolved_patterns, ignored_patterns_count = resolve_pattern_conflicts(raw_patterns)
+    score = _score_patterns(resolved_patterns, trend)
+    bullish_score = score["bullish_score"]
+    bearish_score = score["bearish_score"]
+    total_score = score["total_score"]
+    market_state = classify_market_state(df, resolved_patterns, score)
+    latest_pattern = resolved_patterns[0] if resolved_patterns else None
+    top_patterns = sorted(
+        resolved_patterns,
+        key=lambda item: (-abs(item["weighted_score"]), item["candles_ago"], item["priority"]),
+    )[:3]
 
     if total_score > 20:
         overall_bias = "Bullish"
@@ -161,27 +297,46 @@ def analyze_stock(symbol: str) -> dict[str, Any]:
     else:
         overall_bias = "Neutral"
 
-    confidence_score = min(100.0, round(abs(total_score) / MAX_NORMALIZED_SCORE * 100, 1))
-    latest_date = latest_row["Date"].date().isoformat()
+    confidence_score = _calculate_confidence(
+        trend=trend,
+        market_state=market_state,
+        latest_pattern=latest_pattern,
+        top_patterns=top_patterns,
+        bullish_score=bullish_score,
+        bearish_score=bearish_score,
+        total_score=total_score,
+    )
+    latest_datetime = latest_row["Datetime"].isoformat()
     latest_close = float(latest_row["Close"])
     explanation = _build_explanation(
         symbol=symbol,
-        latest_date=latest_date,
+        latest_datetime=latest_datetime,
         latest_close=latest_close,
+        interval=interval,
         trend=trend,
-        detected_patterns=detected_patterns,
+        market_state=market_state,
+        top_patterns=top_patterns,
         overall_bias=overall_bias,
         confidence_score=confidence_score,
-        raw_score=total_score,
+        bullish_score=bullish_score,
+        bearish_score=bearish_score,
+        total_score=total_score,
+        ignored_patterns_count=ignored_patterns_count,
     )
 
     return {
         "symbol": symbol.upper(),
-        "latest_date": latest_date,
+        "latest_datetime": latest_datetime,
         "latest_close": round(latest_close, 2),
+        "interval": interval,
         "trend": trend,
-        "detected_patterns": detected_patterns,
+        "market_state": market_state,
         "overall_bias": overall_bias,
         "confidence_score": confidence_score,
+        "bullish_score": bullish_score,
+        "bearish_score": bearish_score,
+        "total_score": total_score,
+        "top_patterns": top_patterns,
+        "ignored_patterns_count": ignored_patterns_count,
         "explanation": explanation,
     }

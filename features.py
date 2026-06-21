@@ -1,4 +1,4 @@
-"""Feature engineering for candlestick and chart-pattern analysis."""
+"""Feature engineering for 15-minute candlestick analysis."""
 
 from __future__ import annotations
 
@@ -6,11 +6,11 @@ import numpy as np
 import pandas as pd
 
 
-REQUIRED_COLUMNS = ["Date", "Open", "High", "Low", "Close", "Volume"]
+REQUIRED_COLUMNS = ["Datetime", "Open", "High", "Low", "Close", "Volume"]
 
 
 def add_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Add technical features used by the rule-based pattern detector."""
+    """Add intraday bar features used by the rule-based pattern detector."""
     missing_columns = [column for column in REQUIRED_COLUMNS if column not in df.columns]
     if missing_columns:
         raise ValueError(f"Input DataFrame is missing required columns: {missing_columns}")
@@ -29,21 +29,45 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     feature_df["Lower_Wick_Ratio"] = feature_df["Lower_Wick"] / safe_range
     feature_df["Is_Bullish"] = feature_df["Close"] > feature_df["Open"]
     feature_df["Is_Bearish"] = feature_df["Close"] < feature_df["Open"]
-    feature_df["Daily_Return"] = feature_df["Close"].pct_change(fill_method=None)
-    feature_df["MA_20"] = feature_df["Close"].rolling(window=20, min_periods=20).mean()
-    feature_df["MA_50"] = feature_df["Close"].rolling(window=50, min_periods=50).mean()
-    feature_df["MA_200"] = feature_df["Close"].rolling(window=200, min_periods=200).mean()
-    feature_df["Volume_MA_20"] = (
+    feature_df["Bar_Return"] = feature_df["Close"].pct_change(fill_method=None)
+    feature_df["MA_20_Bars"] = feature_df["Close"].rolling(window=20, min_periods=20).mean()
+    feature_df["MA_50_Bars"] = feature_df["Close"].rolling(window=50, min_periods=50).mean()
+    feature_df["Avg_Range_20_Bars"] = (
+        feature_df["Candle_Range"].rolling(window=20, min_periods=20).mean()
+    )
+    feature_df["Volume_MA_20_Bars"] = (
         feature_df["Volume"].rolling(window=20, min_periods=20).mean()
     )
-    feature_df["Volatility_20"] = (
-        feature_df["Daily_Return"].rolling(window=20, min_periods=20).std()
+    feature_df["Range_Strength"] = feature_df["Candle_Range"] / feature_df["Avg_Range_20_Bars"]
+    feature_df["Volume_Strength"] = feature_df["Volume"] / feature_df["Volume_MA_20_Bars"]
+    feature_df["Is_Significant_Candle"] = (
+        (feature_df["Candle_Range"] >= 0.8 * feature_df["Avg_Range_20_Bars"])
+        | (feature_df["Volume"] >= feature_df["Volume_MA_20_Bars"])
     )
-    feature_df["Rolling_High_20"] = (
+    feature_df["Strong_Volume"] = feature_df["Volume"] >= 1.2 * feature_df["Volume_MA_20_Bars"]
+    feature_df["Strong_Range"] = (
+        feature_df["Candle_Range"] >= 1.2 * feature_df["Avg_Range_20_Bars"]
+    )
+    feature_df["Volatility_20_Bars"] = (
+        feature_df["Bar_Return"].rolling(window=20, min_periods=20).std()
+    )
+    feature_df["Rolling_High_20_Bars"] = (
         feature_df["High"].rolling(window=20, min_periods=20).max().shift(1)
     )
-    feature_df["Rolling_Low_20"] = (
+    feature_df["Rolling_Low_20_Bars"] = (
         feature_df["Low"].rolling(window=20, min_periods=20).min().shift(1)
+    )
+    feature_df["Trading_Date"] = feature_df["Datetime"].dt.date
+
+    grouped_by_date = feature_df.groupby("Trading_Date", sort=False)
+    feature_df["Session_High"] = grouped_by_date["High"].cummax()
+    feature_df["Session_Low"] = grouped_by_date["Low"].cummin()
+    feature_df["Session_Open"] = grouped_by_date["Open"].transform("first")
+    feature_df["Distance_From_Session_High"] = (
+        (feature_df["Close"] - feature_df["Session_High"]) / feature_df["Session_High"]
+    )
+    feature_df["Distance_From_Session_Low"] = (
+        (feature_df["Close"] - feature_df["Session_Low"]) / feature_df["Session_Low"]
     )
 
     feature_df = feature_df.replace([np.inf, -np.inf], np.nan)

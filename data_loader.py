@@ -1,4 +1,4 @@
-"""Utilities for downloading and cleaning historical stock data."""
+"""Utilities for downloading and cleaning intraday stock data."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import pandas as pd
 import yfinance as yf
 
 
-REQUIRED_COLUMNS = ["Date", "Open", "High", "Low", "Close", "Volume"]
+REQUIRED_COLUMNS = ["Datetime", "Open", "High", "Low", "Close", "Volume"]
 
 
 def _flatten_columns(columns: pd.Index) -> list[str]:
@@ -24,12 +24,18 @@ def _flatten_columns(columns: pd.Index) -> list[str]:
 
 def load_stock_data(
     symbol: str,
-    period: str = "2y",
-    interval: str = "1d",
+    period: str = "1mo",
+    interval: str = "15m",
 ) -> pd.DataFrame:
-    """Download OHLCV data for one symbol and return a clean DataFrame."""
+    """Download intraday OHLCV data for one symbol and return a clean DataFrame."""
     if not symbol or not isinstance(symbol, str):
         raise ValueError("symbol must be a non-empty string.")
+
+    if interval == "15m" and period.endswith("y"):
+        raise ValueError(
+            "yfinance 15-minute intraday data cannot be requested with year-based periods. "
+            "Use a recent period such as '1mo' because intraday history is limited."
+        )
 
     data = yf.download(
         tickers=symbol,
@@ -49,9 +55,9 @@ def load_stock_data(
     data.columns = _flatten_columns(data.columns)
     data = data.reset_index()
 
-    if "Date" not in data.columns:
+    if "Datetime" not in data.columns:
         first_column = data.columns[0]
-        data = data.rename(columns={first_column: "Date"})
+        data = data.rename(columns={first_column: "Datetime"})
 
     missing_columns = [column for column in REQUIRED_COLUMNS if column not in data.columns]
     if missing_columns:
@@ -60,14 +66,14 @@ def load_stock_data(
         )
 
     clean_df = data.loc[:, REQUIRED_COLUMNS].copy()
-    clean_df["Date"] = pd.to_datetime(clean_df["Date"])
+    clean_df["Datetime"] = pd.to_datetime(clean_df["Datetime"])
 
     numeric_columns = ["Open", "High", "Low", "Close", "Volume"]
     for column in numeric_columns:
         clean_df[column] = pd.to_numeric(clean_df[column], errors="coerce")
 
     clean_df = clean_df.dropna(subset=numeric_columns)
-    clean_df = clean_df.sort_values("Date").reset_index(drop=True)
+    clean_df = clean_df.sort_values("Datetime").reset_index(drop=True)
 
     if clean_df.empty:
         raise ValueError(f"All rows for symbol '{symbol}' were empty after cleaning.")
