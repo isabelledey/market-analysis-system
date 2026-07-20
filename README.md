@@ -1,69 +1,284 @@
 # Stock Pattern Model
 
-This project is a beginner-friendly, rule-based intraday stock market analysis module. It downloads 15-minute OHLCV data from `yfinance`, creates candlestick and technical features with `pandas` and `numpy`, detects common intraday chart and candlestick patterns, filters noisy signals, and summarizes the latest market bias with a confidence score and plain-English explanation.
+## Project Overview
 
-The model now analyzes intraday `15-minute` candles only. It does not analyze daily candles. The project is intentionally focused only on the analysis layer. It does not include a web app, API, frontend, or machine learning model yet. The pattern logic is fully rule-based so it can be reviewed, tested, and later upgraded into a supervised learning workflow when labeled data is available.
+`stock-pattern-model` is an educational, rule-based technical-analysis application for intraday OHLCV data. It focuses on the analysis layer only: loading validated market data, engineering features, detecting chart and candlestick patterns, scoring recent evidence, and producing structured text or JSON output.
 
-## Project Structure
+This project currently supports:
 
-```text
-stock-pattern-model/
-├── data_loader.py
-├── features.py
-├── pattern_detector.py
-├── model.py
-├── main.py
-├── requirements.txt
-└── README.md
-```
+- Offline analysis from CSV and Parquet files
+- Provider-based loading through `YFinanceProvider` and `FileDataProvider`
+- Completed-candle filtering with injectable `as_of`
+- Exact pattern timestamps in exchange time and display time
+- Ticker analysis and Israeli security-number resolution through a CSV mapping file
+- A registry-based pattern system with confirmed, tentative, failed, and expired events
+- Structured scoring, market-state logic, and human-readable explanations
 
-## What the Project Does
+This project does **not** currently include:
 
-The model performs these steps:
+- Brokerage integration
+- Live order execution
+- Portfolio management
+- Historical trading simulation
+- Backtesting
+- Paper trading
+- Stop-loss order simulation
+- Take-profit order simulation
+- Trade-level profit and loss calculations
+- Portfolio equity curves
+- Sharpe-ratio calculations
+- Guaranteed market predictions
+- Statistically calibrated success probabilities
 
-1. Downloads intraday stock data from `yfinance`
-2. Cleans the OHLCV dataset
-3. Computes 15-minute bar structure, moving averages, rolling highs/lows, returns, session levels, volatility, and candle significance filters
-4. Detects intraday candlestick and breakout patterns using explicit rules
-5. Filters weak and conflicting signals so noisy candles do not dominate the result
-6. Classifies the latest intraday trend and market state
-7. Scores recent bullish and bearish signals from the last 12 candles
-8. Returns a structured summary with confidence and explanation
+Backtesting and trading simulation were not implemented in this project version.
 
-## Intraday Data Limit
-
-`yfinance` intraday history is limited. For `15m` candles, the model uses a default `period="1mo"` and does not attempt to analyze 2 years of data. Intraday data cannot extend beyond the recent Yahoo Finance history window.
+Supported Python version: `Python 3.9+`
 
 ## Installation
 
-Install the required packages:
-
 ```bash
 cd stock-pattern-model
-pip install -r requirements.txt
+python3 -m pip install -r requirements.txt
 ```
 
-## How to Run
+## Package Usage
 
-Run the sample analysis script:
+The package exposes analysis and provider APIs without doing any work at import time:
+
+```python
+from stock_pattern_model import analyze_dataframe, analyze_stock
+```
+
+Importing `main` or `stock_pattern_model` does not trigger analysis, network calls, or terminal output.
+
+## CLI Usage
+
+Package CLI:
 
 ```bash
-cd stock-pattern-model
-python main.py
+python3 -m stock_pattern_model --help
+python3 -m stock_pattern_model analyze --help
 ```
 
-The default watchlist in `main.py` is:
+Root-level compatibility wrapper:
 
-- `AAPL`
-- `MSFT`
-- `NVDA`
-- `TSLA`
+```bash
+python3 main.py --help
+python3 main.py
+python3 main.py AAPL
+python3 main.py TEVA.TA
+python3 main.py analyze AAPL
+```
 
-You can edit that list directly in `main.py` to analyze other tickers.
+`main.py` is only a thin compatibility wrapper around the packaged CLI. It does not implement a separate analysis flow.
 
-## Detected Patterns
+## Analysis Usage
 
-The current rule-based detector looks for:
+Interactive input:
+
+```bash
+python3 -m stock_pattern_model analyze
+python3 main.py
+```
+
+Both commands prompt:
+
+```text
+Enter a ticker or Israeli security number:
+```
+
+Direct ticker analysis:
+
+```bash
+python3 -m stock_pattern_model analyze AAPL
+python3 main.py AAPL
+```
+
+Exchange-qualified tickers are preserved:
+
+```bash
+python3 -m stock_pattern_model analyze TEVA.TA
+python3 -m stock_pattern_model analyze BRK-B
+```
+
+Israeli security numbers require a real mapping file:
+
+```bash
+python3 -m stock_pattern_model analyze 1084128 --mapping-file data/tase_securities.csv
+```
+
+Example mapping schema:
+
+```csv
+security_number,yahoo_symbol,name,exchange,currency,timezone
+1084128,TEVA.TA,Teva Pharmaceutical Industries,TASE,ILS,Asia/Jerusalem
+```
+
+`data/tase_securities.example.csv` is only an example schema and must not be treated as authoritative real-world data.
+
+JSON output:
+
+```bash
+python3 -m stock_pattern_model analyze AAPL --format json
+```
+
+Text output:
+
+```bash
+python3 -m stock_pattern_model analyze AAPL --format text
+```
+
+Write output to a file:
+
+```bash
+python3 -m stock_pattern_model analyze AAPL --format json --output outputs/aapl_analysis.json
+```
+
+Show all patterns:
+
+```bash
+python3 -m stock_pattern_model analyze AAPL --all-patterns
+```
+
+Limit top patterns:
+
+```bash
+python3 -m stock_pattern_model analyze AAPL --top 5
+```
+
+Choose a display timezone:
+
+```bash
+python3 -m stock_pattern_model analyze AAPL --display-timezone Asia/Jerusalem
+```
+
+Provide an explicit `as_of`:
+
+```bash
+python3 -m stock_pattern_model analyze AAPL --as-of 2026-07-10T16:46:00-04:00
+```
+
+Empty interactive input is rejected with a nonzero exit code. The CLI never falls back to a hardcoded default symbol or batch list.
+
+## Market-Data Layer
+
+### Provider Interfaces
+
+- `MarketDataProvider`: abstract interface used by the analysis layer
+- `YFinanceProvider`: live-provider implementation with validation, retry, metadata capture, and optional Parquet cache
+- `FileDataProvider`: offline provider for CSV and Parquet analysis
+
+### File Inputs
+
+Supported file formats:
+
+- CSV
+- Parquet
+
+Required canonical columns:
+
+- `Datetime`
+- `Open`
+- `High`
+- `Low`
+- `Close`
+- `Volume`
+
+Common case and naming variations are normalized when unambiguous, such as `timestamp`, `open`, and `volume`.
+
+Offline analysis:
+
+```bash
+python3 -m stock_pattern_model analyze TEST \
+  --data-file tests/fixtures/sample_ohlcv.csv \
+  --exchange-timezone America/New_York
+```
+
+### Cache Behavior
+
+`YFinanceProvider` supports:
+
+- Local Parquet cache
+- Configurable cache directory
+- Configurable cache expiration through `--cache-ttl`
+- Cache bypass through `--no-cache`
+
+Cached data is not committed to the repository and should stay outside versioned fixtures.
+
+### Provider Errors
+
+Provider failures preserve the original cause. Normal CLI usage prints concise user-facing errors. `--verbose` enables debug logging and more useful failure context.
+
+### Data Validation
+
+The validator checks:
+
+- Missing columns
+- Missing OHLCV values
+- Duplicate timestamps
+- Unsorted timestamps
+- Negative prices
+- Zero prices
+- Negative volume
+- Invalid OHLC relationships
+- Irregular same-session interval gaps
+- Timezone-naive timestamps without an explicit exchange timezone
+
+Strict mode is the default. In strict mode, invalid OHLC rows are rejected instead of silently repaired.
+
+Duplicate timestamps are reported.
+
+Missing bars generate warnings.
+
+Timezone-naive file data is never silently interpreted as UTC.
+
+Daylight-saving transitions are handled during localization with explicit timezone rules.
+
+Cleaning behavior, when enabled through non-strict validation, is explicit and recorded in `DataQualityReport.cleaning_actions`.
+
+## Timestamp Semantics
+
+- `bar_start_at`: the candle start timestamp
+- `bar_end_at`: the candle close timestamp
+- `pattern_start_at`: the first candle that belongs to the pattern
+- `pattern_end_at`: the final candle that completes the pattern structure
+- `detected_at`: the earliest time the pattern became knowable
+
+A candle pattern is only detectable after its final candle closes.
+
+Multi-candle patterns use:
+
+- The first participating candle for `pattern_start_at`
+- The final participating candle close for `pattern_end_at`
+- The earliest knowable completion time for `detected_at`
+
+Confirmed swing-pivot patterns such as Double Top and Double Bottom may have a `detected_at` later than the original peak or low because pivot confirmation requires future bars.
+
+Incomplete candles are filtered out before features, patterns, and scoring are calculated.
+
+`as_of` is injectable so tests and offline analysis can be deterministic.
+
+Exchange timezone is preserved internally. Display conversion is applied only to user-facing fields.
+
+## Pattern System
+
+### Registry Architecture
+
+Pattern detection is registry-based. Each detector:
+
+- Has a unique `pattern_id`
+- Declares a pattern family
+- Declares minimum required history
+- Returns zero or more `PatternEvent` objects
+- Uses only information available by `detected_at`
+- Does not mutate caller-owned data
+- Does not score final analysis output
+- Does not make network calls
+- Is independently testable
+
+### Implemented Patterns
+
+Implemented and tested patterns:
 
 - Bullish Engulfing
 - Bearish Engulfing
@@ -71,63 +286,248 @@ The current rule-based detector looks for:
 - Shooting Star
 - Inside Bar
 - Inside Bar Failure
-- 20-Bar Breakout
-- 20-Bar Breakdown
-- Intraday trend classification: Uptrend, Downtrend, or Neutral
+- Breakout
+- Breakdown
+- Doji
+- Morning Star
+- Evening Star
+- Double Top
+- Double Bottom
 
-Because intraday data is noisy, the model also applies filtering:
+### Pattern Metadata
 
-- Small candles are ignored unless range or volume is meaningful
-- Stronger volume and stronger range are tracked separately
-- Same-candle conflicts are resolved with a pattern priority system
-- Only the strongest recent patterns influence the final summary
+Each serialized pattern event includes structured metadata such as:
 
-## Output Fields
+- `event_id`
+- `setup_id`
+- `evidence_group`
+- `event_state`
+- `pattern_id`
+- `pattern_name`
+- `pattern_family`
+- `bias`
+- `status`
+- `pattern_start_at`
+- `pattern_end_at`
+- `detected_at`
+- `relevant_prices`
+- `relevant_indices`
+- `detection_reason`
+- `signal_strength`
 
-`analyze_stock(symbol)` returns a dictionary with:
+### Event Status
 
-- `symbol`: the ticker that was analyzed
-- `latest_datetime`: the most recent 15-minute bar timestamp in the dataset
-- `latest_close`: the latest closing price
-- `interval`: the candle interval used for the analysis
-- `trend`: the current intraday trend classification
-- `market_state`: a higher-level label such as `Trending Bullish`, `Choppy`, or `Breakout Attempt`
-- `overall_bias`: `Bullish`, `Bearish`, or `Neutral`
-- `bullish_score`: the recent weighted bullish score including trend alignment
-- `bearish_score`: the recent weighted bearish score including trend alignment
-- `total_score`: `bullish_score - bearish_score`
-- `confidence_score`: a 0 to 100 score based on the weighted rule-based signal strength
-- `top_patterns`: the top 3 recent filtered patterns that most affected the result
-- `ignored_patterns_count`: how many lower-priority conflicting patterns were removed
-- `explanation`: a readable explanation of the latest result
+- `confirmed`: fully confirmed and score-eligible by default
+- `tentative`: visible in output, but not score-eligible by default
+- `failed`: a setup invalidated before confirmation
+- `expired`: a setup or older event that is no longer treated like fresh active evidence
 
-## Pattern Logic Summary
+### Key Detection Rules
 
-Feature engineering includes:
+- Breakout and breakdown use crossing-event semantics, not persistent repeated signals
+- Strong breakout is represented as one stronger event, not both strong and regular events
+- Inside Bar Failure uses explicit mother-bar confirmation
+- Double Top requires confirmed swing highs, a meaningful valley, and neckline confirmation
+- Double Bottom requires confirmed swing lows, an intervening rally, and neckline confirmation
+- Pattern detection is no-look-ahead with respect to historical detection correctness
 
-- Candle body, range, upper wick, and lower wick
-- Candle body and wick ratios
-- Bullish and bearish candle direction flags
-- 15-minute bar return
-- 20 bar and 50 bar moving averages
-- 20 bar rolling volume average
-- 20 bar rolling volatility
-- Previous 20 bar rolling high and low levels
-- Trading date, session open, session high, and session low
-- Distance from current session high and low
-- Average 20 bar candle range
-- Range strength and volume strength
-- Strong volume, strong range, and candle significance filters
+Configurable tolerances cover:
 
-Scoring includes:
+- Doji body tolerance
+- Star gap tolerance
+- Pivot confirmation strength
+- Double-pattern price tolerance
+- Minimum and maximum pattern separation
 
-- Bullish patterns add positive points
-- Bearish patterns add negative points
-- More recent patterns have larger weights
-- Trend direction adds extra context to the final score
-- Conflicting same-candle patterns are filtered by priority
-- Confidence is reduced when the market is choppy or balanced
+## Features And Volume
 
-## Important Note
+Continuous features:
 
-This project is an educational analytical model, not financial advice. It is designed to demonstrate rule-based intraday technical analysis concepts and should not be used as the sole basis for trading or investment decisions.
+- `Continuous_MA_20`
+- `Continuous_MA_50`
+
+Session-reset features:
+
+- `Session_MA_20`
+- `Session_High`
+- `Session_Low`
+- `Session_Open`
+
+Continuous moving averages may span multiple sessions and are not described as session-only indicators.
+
+Volume handling includes:
+
+- Time-of-day volume baseline when enough prior same-time candles exist
+- Rolling 20-bar fallback when time-of-day history is insufficient
+
+The chosen volume baseline is surfaced in pattern explanations and result metadata.
+
+## Scoring And Output
+
+The analysis separates:
+
+- `trend`
+- `market_state`
+- `overall_bias`
+
+Meaning:
+
+- `trend`: moving-average structure only
+- `market_state`: the current technical context
+- `overall_bias`: final directional leaning after deduplicated evidence is scored
+
+Scoring fields:
+
+- `trend_score`
+- `pattern_score`
+- `volume_score`
+- `bullish_score`
+- `bearish_score`
+- `net_signal_score`
+- `rule_confidence`
+
+Evidence deduplication uses:
+
+- `event_id`
+- `setup_id`
+- `evidence_group`
+
+Only the strongest event in an overlapping evidence group gets full scoring weight. Related overlapping events may still appear in output historically, but as suppressed evidence.
+
+Recency and expiration:
+
+- Newer events receive more weight
+- Old events decay and eventually stop influencing directional scores
+- Expired patterns may still be displayed historically but should not be treated like fresh evidence
+
+Conflict handling:
+
+- Bullish and bearish evidence can coexist
+- Conflicts reduce confidence
+- Conflicts can neutralize final bias even when one side is slightly stronger
+
+Data-quality warnings reduce confidence when relevant.
+
+Tentative patterns do not affect default directional signals.
+
+Neutral patterns do not contribute bullish or bearish directional scores.
+
+Structured explanation output includes:
+
+- `summary`
+- `bullish_evidence`
+- `bearish_evidence`
+- `conflicts`
+- `data_warnings`
+- `reason_for_bias`
+- `reason_for_confidence`
+
+Important:
+
+```text
+Rule confidence is an uncalibrated rule-strength score.
+It is not a statistical probability and is not a prediction accuracy percentage.
+```
+
+Also note:
+
+- A bullish trend can coexist with a neutral overall bias
+- High rule confidence does not guarantee future market movement
+- Conflicting evidence can reduce the final bias
+- Neutral output should not be interpreted as a strong recommendation
+
+## Text And JSON Output
+
+Text output includes:
+
+- Instrument and resolved symbol
+- Input identifier
+- Security number, when relevant
+- Name, when available
+- Exchange and currency
+- Interval
+- Analysis time
+- Exchange timezone and display timezone
+- Latest completed candle start and end
+- Latest close
+- Trend, market state, overall bias
+- Trend score, pattern score, volume score
+- Bullish score, bearish score, net signal score
+- Rule confidence
+- Pattern details with exact detection times
+- Warnings and data-quality summary
+- Structured explanation
+
+JSON output:
+
+- Uses valid JSON
+- Uses ISO-8601 timestamps with timezone offsets
+- Includes serialized pattern metadata
+- Includes data-quality information
+- Includes scoring fields
+- Includes explanations
+- Avoids raw Python objects such as `Timestamp`, `Enum`, `NaN`, and tuples
+
+## Exit Codes
+
+CLI exit codes are consistent and nonzero for common failure classes:
+
+- `2`: invalid input or invalid general configuration
+- `3`: unknown Israeli security number
+- `4`: missing mapping file
+- `5`: invalid mapping file
+- `6`: market-data provider failure
+- `7`: data-validation failure
+- `8`: output-file failure
+- `9`: invalid timezone
+- `10`: no completed bars
+- `11`: missing data file
+- `12`: unexpected internal failure
+
+## Testing And Verification
+
+Run the full test suite:
+
+```bash
+pytest
+```
+
+Run compilation checks:
+
+```bash
+python3 -m compileall stock_pattern_model
+python3 -m compileall main.py
+```
+
+Offline fixture tests cover:
+
+- Pattern detection
+- Timestamp semantics
+- Provider and cache behavior
+- Instrument resolution
+- CLI behavior
+- Scoring and explanation consistency
+
+## Known Limitations
+
+- Live `yfinance` availability depends on internet access and external provider behavior
+- Provider metadata may be incomplete or unavailable
+- Israeli security-number resolution is only as complete as the mapping file you provide
+- Data-quality validation catches many structural issues, but rule-based analysis still depends on input quality
+- Pattern recognition is deterministic and educational, not exhaustive
+- Rule confidence is not statistically calibrated
+
+## Educational And Financial Disclaimer
+
+This repository is an educational technical-analysis application.
+
+It does not provide financial advice, guaranteed predictions, or statistically calibrated success probabilities. Use it to study data handling, timestamp correctness, rule-based pattern detection, and structured analysis output.
+
+## Optional Future Work
+
+Possible future improvements, not implemented in the current version:
+
+- Broader instrument metadata sources
+- Additional tested chart patterns
+- Packaged project metadata such as a publishable `pyproject.toml`
+- Historical simulation or backtesting in a separate, explicitly scoped module
