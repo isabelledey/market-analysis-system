@@ -8,6 +8,7 @@ from statistics import mean
 from typing import Any
 
 from stock_pattern_model.config import ScoringConfig
+from stock_pattern_model.datetime_utils import format_compact_display_datetime
 from stock_pattern_model.domain import DataQualityReport
 
 
@@ -31,6 +32,10 @@ class ScoringService:
         *,
         symbol: str,
         trend: str,
+        trend_structure_score: float | None = None,
+        trend_evidence: list[str] | None = None,
+        trend_horizon: str | None = None,
+        display_timezone: str = "Asia/Jerusalem",
         patterns: list[dict[str, Any]],
         quality_report: DataQualityReport,
         latest_close: float,
@@ -64,6 +69,9 @@ class ScoringService:
         structured_explanation = self._build_structured_explanation(
             symbol=symbol,
             trend=trend,
+            trend_structure_score=trend_structure_score,
+            trend_evidence=trend_evidence or [],
+            trend_horizon=trend_horizon,
             market_state=market_state,
             overall_bias=overall_bias,
             primary_patterns=primary_patterns,
@@ -74,6 +82,7 @@ class ScoringService:
             latest_bar_end_display=latest_bar_end_display,
             interval=interval,
             latest_volume_baseline_source=latest_volume_baseline_source,
+            display_timezone=display_timezone,
             score=score,
             rule_confidence=rule_confidence,
         )
@@ -254,7 +263,12 @@ class ScoringService:
             for pattern in primary_patterns
             if pattern["status"] == "confirmed"
         ]
-        if not confirmed_patterns:
+        directional_confirmed_patterns = [
+            pattern
+            for pattern in confirmed_patterns
+            if pattern["bias"] in {"Bullish", "Bearish"}
+        ]
+        if not directional_confirmed_patterns:
             return "Neutral"
         if abs(score["net_signal_score"]) < self.config.bias_threshold:
             return "Neutral"
@@ -339,6 +353,9 @@ class ScoringService:
         *,
         symbol: str,
         trend: str,
+        trend_structure_score: float | None,
+        trend_evidence: list[str],
+        trend_horizon: str | None,
         market_state: str,
         overall_bias: str,
         primary_patterns: list[dict[str, Any]],
@@ -349,6 +366,7 @@ class ScoringService:
         latest_bar_end_display: str,
         interval: str,
         latest_volume_baseline_source: str,
+        display_timezone: str,
         score: dict[str, float],
         rule_confidence: float,
     ) -> dict[str, Any]:
@@ -405,16 +423,29 @@ class ScoringService:
         if not confidence_reasons:
             confidence_reasons.append("The score reflects rule strength only and is not statistically calibrated.")
 
+        trend_clause = f"Trend: {trend}."
+        if trend_structure_score is not None:
+            trend_clause = f"Trend: {trend} (score {trend_structure_score:.2f})."
+        if trend_horizon:
+            trend_clause = f"{trend_clause} Trend horizon: {trend_horizon}."
+
         summary = (
             f"{symbol} last traded at {latest_close:.2f} on the completed {interval} candle from "
-            f"{latest_bar_start_display} to {latest_bar_end_display}. Trend: {trend}. "
+            f"{latest_bar_start_display} to {latest_bar_end_display}. {trend_clause} "
             f"Market state: {market_state}. Overall bias: {overall_bias}. "
             f"Net signal score: {score['net_signal_score']:.2f}. Rule confidence: {rule_confidence:.1f}/100."
         )
         return {
             "summary": summary,
-            "bullish_evidence": [self._format_evidence_line(pattern) for pattern in bullish_patterns[:3]],
-            "bearish_evidence": [self._format_evidence_line(pattern) for pattern in bearish_patterns[:3]],
+            "trend_evidence": trend_evidence,
+            "bullish_evidence": [
+                self._format_evidence_line(pattern, display_timezone=display_timezone)
+                for pattern in bullish_patterns[:3]
+            ],
+            "bearish_evidence": [
+                self._format_evidence_line(pattern, display_timezone=display_timezone)
+                for pattern in bearish_patterns[:3]
+            ],
             "conflicts": conflicts,
             "data_warnings": list(quality_report.warnings),
             "reason_for_bias": reason_for_bias,
@@ -423,6 +454,8 @@ class ScoringService:
 
     def _build_text_explanation(self, structured_explanation: dict[str, Any]) -> str:
         parts = [structured_explanation["summary"]]
+        if structured_explanation.get("trend_evidence"):
+            parts.append("Trend evidence: " + "; ".join(structured_explanation["trend_evidence"]) + ".")
         if structured_explanation["bullish_evidence"]:
             parts.append("Bullish evidence: " + "; ".join(structured_explanation["bullish_evidence"]) + ".")
         if structured_explanation["bearish_evidence"]:
@@ -439,11 +472,11 @@ class ScoringService:
         )
         return " ".join(parts)
 
-    def _format_evidence_line(self, pattern: dict[str, Any]) -> str:
-        detected_at = pattern["event"].detected_at
+    def _format_evidence_line(self, pattern: dict[str, Any], *, display_timezone: str) -> str:
+        detected_at = format_compact_display_datetime(pattern["event"].detected_at, display_timezone)
         return (
             f"{pattern['pattern_name']} [{pattern['status']}, {pattern['event_state']}] "
-            f"detected at {detected_at.strftime('%Y-%m-%d %H:%M %Z')} with {pattern['detection_reason']}"
+            f"detected at {detected_at} with {pattern['detection_reason']}"
         )
 
     def _build_event_id(self, pattern: dict[str, Any]) -> str:
@@ -467,8 +500,10 @@ class ScoringService:
             return f"upside_break:{event.detected_at.isoformat()}"
         if pattern["pattern_id"] in {"breakdown", "double_top"}:
             return f"downside_break:{event.detected_at.isoformat()}"
-        if pattern["pattern_family"] in {"engulfing", "pin_bar", "doji", "star"}:
-            return f"candlestick:{pattern['bias']}:{event.bar_start_at.isoformat()}"
+        if pattern["pattern_family"] in {"pin_bar", "doji", "star"}:
+            return f"candlestick:{event.bar_start_at.isoformat()}"
+        if pattern["pattern_family"] == "engulfing":
+            return f"engulfing:{pattern['bias']}:{event.pattern_start_at.isoformat()}:{event.pattern_end_at.isoformat()}"
         if pattern["pattern_family"] in {"inside_bar", "inside_bar_failure"}:
             return f"inside_structure:{pattern['bias']}:{event.pattern_end_at.isoformat()}"
         key_price = (

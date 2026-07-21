@@ -9,6 +9,9 @@ import pandas as pd
 
 from stock_pattern_model.config import AnalysisConfig
 from stock_pattern_model.config import MarketDataConfig
+from stock_pattern_model.datetime_utils import convert_to_timezone
+from stock_pattern_model.datetime_utils import format_display_datetime
+from stock_pattern_model.datetime_utils import format_iso_timestamp
 from stock_pattern_model.domain import DataQualityReport
 from stock_pattern_model.domain import PatternEvent
 from stock_pattern_model.domain import PatternStatus
@@ -112,18 +115,15 @@ def _run_pattern_pipeline(
     config: AnalysisConfig,
     registry: PatternRegistry,
 ) -> tuple[pd.DataFrame, list[PatternEvent]]:
-    pattern_df = classify_intraday_trend(add_features(df))
+    pattern_df = classify_intraday_trend(
+        add_features(df),
+        lookback_bars=config.scoring.lookback_bars,
+        pivot_left_bars=config.pattern.pivot_left_bars,
+        pivot_right_bars=config.pattern.pivot_right_bars,
+        breakout_lookback=config.pattern.breakout_lookback,
+    )
     pattern_events = detect_patterns(pattern_df, config.pattern, config.interval, registry=registry)
     return pattern_df, pattern_events
-
-
-def _format_iso_timestamp(timestamp: pd.Timestamp) -> str:
-    return timestamp.isoformat(timespec="minutes")
-
-
-def _format_display_timestamp(timestamp: pd.Timestamp) -> str:
-    timezone_name = str(timestamp.tzinfo)
-    return f"{timestamp.strftime('%Y-%m-%d %H:%M')} {timezone_name}"
 
 
 def _detected_bar_start(pattern: PatternEvent, interval: str) -> pd.Timestamp:
@@ -204,11 +204,11 @@ def _serialize_pattern_event(
     bar_end_exchange = event.bar_end_at
     detected_at_exchange = event.detected_at
 
-    pattern_start_display = pattern_start_exchange.tz_convert(display_timezone)
-    pattern_end_display = pattern_end_exchange.tz_convert(display_timezone)
-    bar_start_display = bar_start_exchange.tz_convert(display_timezone)
-    bar_end_display = bar_end_exchange.tz_convert(display_timezone)
-    detected_at_display = detected_at_exchange.tz_convert(display_timezone)
+    pattern_start_display = convert_to_timezone(pattern_start_exchange, display_timezone)
+    pattern_end_display = convert_to_timezone(pattern_end_exchange, display_timezone)
+    bar_start_display = convert_to_timezone(bar_start_exchange, display_timezone)
+    bar_end_display = convert_to_timezone(bar_end_exchange, display_timezone)
+    detected_at_display = convert_to_timezone(detected_at_exchange, display_timezone)
 
     return {
         "event_id": pattern["event_id"],
@@ -220,23 +220,28 @@ def _serialize_pattern_event(
         "pattern_family": event.pattern_family.value,
         "bias": event.bias,
         "status": event.status.value,
-        "pattern_start_at": _format_iso_timestamp(pattern_start_exchange),
-        "pattern_end_at": _format_iso_timestamp(pattern_end_exchange),
-        "bar_start_at": _format_iso_timestamp(bar_start_exchange),
-        "bar_end_at": _format_iso_timestamp(bar_end_exchange),
-        "detected_at": _format_iso_timestamp(detected_at_exchange),
+        "pattern_start_at": format_iso_timestamp(pattern_start_exchange),
+        "pattern_end_at": format_iso_timestamp(pattern_end_exchange),
+        "bar_start_at": format_iso_timestamp(bar_start_exchange),
+        "bar_end_at": format_iso_timestamp(bar_end_exchange),
+        "detected_at": format_iso_timestamp(detected_at_exchange),
+        "pattern_start_at_utc": format_iso_timestamp(pattern_start_exchange, timezone="UTC"),
+        "pattern_end_at_utc": format_iso_timestamp(pattern_end_exchange, timezone="UTC"),
+        "bar_start_at_utc": format_iso_timestamp(bar_start_exchange, timezone="UTC"),
+        "bar_end_at_utc": format_iso_timestamp(bar_end_exchange, timezone="UTC"),
+        "detected_at_utc": format_iso_timestamp(detected_at_exchange, timezone="UTC"),
         "exchange_timezone": event.exchange_timezone,
         "display_timezone": str(display_timezone),
-        "pattern_start_exchange": _format_display_timestamp(pattern_start_exchange),
-        "pattern_end_exchange": _format_display_timestamp(pattern_end_exchange),
-        "bar_start_exchange": _format_display_timestamp(bar_start_exchange),
-        "bar_end_exchange": _format_display_timestamp(bar_end_exchange),
-        "detected_at_exchange": _format_display_timestamp(detected_at_exchange),
-        "pattern_start_display": _format_display_timestamp(pattern_start_display),
-        "pattern_end_display": _format_display_timestamp(pattern_end_display),
-        "bar_start_display": _format_display_timestamp(bar_start_display),
-        "bar_end_display": _format_display_timestamp(bar_end_display),
-        "detected_at_display": _format_display_timestamp(detected_at_display),
+        "pattern_start_exchange": format_display_datetime(pattern_start_exchange, event.exchange_timezone),
+        "pattern_end_exchange": format_display_datetime(pattern_end_exchange, event.exchange_timezone),
+        "bar_start_exchange": format_display_datetime(bar_start_exchange, event.exchange_timezone),
+        "bar_end_exchange": format_display_datetime(bar_end_exchange, event.exchange_timezone),
+        "detected_at_exchange": format_display_datetime(detected_at_exchange, event.exchange_timezone),
+        "pattern_start_display": format_display_datetime(pattern_start_display, display_timezone),
+        "pattern_end_display": format_display_datetime(pattern_end_display, display_timezone),
+        "bar_start_display": format_display_datetime(bar_start_display, display_timezone),
+        "bar_end_display": format_display_datetime(bar_end_display, display_timezone),
+        "detected_at_display": format_display_datetime(detected_at_display, display_timezone),
         "candles_ago": pattern["candles_ago"],
         "base_score": pattern["base_score"],
         "weighted_score": pattern["weighted_score"],
@@ -317,6 +322,9 @@ def analyze_dataframe(
 
     latest_row = pattern_df.iloc[-1]
     trend = str(latest_row["Trend"])
+    trend_structure_score = round(float(latest_row.get("Trend_Score", 0.0)), 2)
+    trend_evidence = list(latest_row.get("Trend_Evidence", []))
+    trend_horizon = str(latest_row.get("Trend_Horizon", "Short-to-medium term"))
     resolved_events, ignored_patterns_count = resolve_pattern_conflicts(raw_events)
     prepared_patterns = _prepare_pattern_records(
         pattern_df,
@@ -327,19 +335,23 @@ def analyze_dataframe(
     )
     latest_bar_start_exchange = pd.Timestamp(latest_row["Datetime"])
     latest_bar_end_exchange = _get_bar_end(latest_bar_start_exchange, interval)
-    latest_bar_start_display = latest_bar_start_exchange.tz_convert(display_zone)
-    latest_bar_end_display = latest_bar_end_exchange.tz_convert(display_zone)
+    latest_bar_start_display = convert_to_timezone(latest_bar_start_exchange, display_zone)
+    latest_bar_end_display = convert_to_timezone(latest_bar_end_exchange, display_zone)
     latest_close = round(float(latest_row["Close"]), 2)
     latest_volume_baseline_source = str(latest_row.get("Volume_Baseline_Source", "unknown"))
 
     scoring_result = ScoringService(config.scoring).evaluate(
         symbol=symbol,
         trend=trend,
+        trend_structure_score=trend_structure_score,
+        trend_evidence=trend_evidence,
+        trend_horizon=trend_horizon,
+        display_timezone=str(display_zone),
         patterns=prepared_patterns,
         quality_report=quality_report,
         latest_close=latest_close,
-        latest_bar_start_display=_format_display_timestamp(latest_bar_start_display),
-        latest_bar_end_display=_format_display_timestamp(latest_bar_end_display),
+        latest_bar_start_display=format_display_datetime(latest_bar_start_display, display_zone),
+        latest_bar_end_display=format_display_datetime(latest_bar_end_display, display_zone),
         interval=interval,
         latest_volume_baseline_source=latest_volume_baseline_source,
     )
@@ -371,21 +383,37 @@ def analyze_dataframe(
             "Rolling 20-bar volume baseline used because time-of-day history was insufficient."
         )
 
+    analysis_time_display = format_display_datetime(normalized_as_of, display_zone)
+    analysis_time_exchange = format_display_datetime(normalized_as_of, _get_exchange_timezone(pattern_df))
+
     return {
         "instrument": resolved_instrument.to_dict(),
         "symbol": resolved_instrument.symbol.upper(),
-        "as_of": _format_iso_timestamp(normalized_as_of),
+        "as_of": format_iso_timestamp(normalized_as_of, timezone="UTC"),
+        "analysis_time": analysis_time_display,
+        "analysis_time_display": analysis_time_display,
+        "analysis_time_exchange": analysis_time_exchange,
         "exchange_timezone": _get_exchange_timezone(pattern_df),
         "display_timezone": display_timezone,
-        "latest_datetime": _format_iso_timestamp(latest_bar_start_exchange),
-        "latest_bar_start": _format_display_timestamp(latest_bar_start_display),
-        "latest_bar_end": _format_display_timestamp(latest_bar_end_display),
-        "latest_bar_start_exchange": _format_display_timestamp(latest_bar_start_exchange),
-        "latest_bar_end_exchange": _format_display_timestamp(latest_bar_end_exchange),
+        "latest_datetime": format_iso_timestamp(latest_bar_start_exchange),
+        "latest_bar_start": format_display_datetime(latest_bar_start_display, display_zone),
+        "latest_bar_end": format_display_datetime(latest_bar_end_display, display_zone),
+        "latest_bar_start_exchange": format_display_datetime(latest_bar_start_exchange, _get_exchange_timezone(pattern_df)),
+        "latest_bar_end_exchange": format_display_datetime(latest_bar_end_exchange, _get_exchange_timezone(pattern_df)),
         "latest_close": latest_close,
         "interval": interval,
         "trend": trend,
-        "trend_score": score["trend_score"],
+        "trend_score": trend_structure_score,
+        "trend_signal_score": score["trend_score"],
+        "trend_horizon": trend_horizon,
+        "trend_lookback_bars": int(latest_row.get("Trend_Lookback_Bars", config.scoring.lookback_bars)),
+        "short_term_trend": str(latest_row.get("Short_Term_Trend", trend)),
+        "medium_term_trend": str(latest_row.get("Medium_Term_Trend", trend)),
+        "long_term_trend": str(latest_row.get("Long_Term_Trend", trend)),
+        "short_term_trend_score": round(float(latest_row.get("Short_Term_Trend_Score", trend_structure_score)), 2),
+        "medium_term_trend_score": round(float(latest_row.get("Medium_Term_Trend_Score", trend_structure_score)), 2),
+        "long_term_trend_score": round(float(latest_row.get("Long_Term_Trend_Score", trend_structure_score)), 2),
+        "trend_evidence": trend_evidence,
         "pattern_score": score["pattern_score"],
         "volume_score": score["volume_score"],
         "bullish_score": score["bullish_score"],

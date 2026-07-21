@@ -28,24 +28,29 @@ def format_analysis_text(
         f"Exchange: {instrument.get('exchange', 'Unknown')}",
         f"Currency: {instrument.get('currency', 'Unknown')}",
         f"Interval: {result.get('interval', 'Unknown')}",
-        f"Analysis Time: {result.get('as_of', 'Unknown')}",
+        f"Analysis Time: {result.get('analysis_time', result.get('as_of', 'Unknown'))}",
         f"Exchange Timezone: {result.get('exchange_timezone', 'Unknown')}",
         f"Display Timezone: {result.get('display_timezone', 'Unknown')}",
-        f"Latest Completed Candle Start: {result.get('latest_bar_start_exchange', 'Unknown')}",
-        f"Latest Completed Candle End: {result.get('latest_bar_end_exchange', 'Unknown')}",
+        f"Latest Completed Candle Start: {result.get('latest_bar_start', 'Unknown')}",
+        f"Latest Completed Candle End: {result.get('latest_bar_end', 'Unknown')}",
         f"Latest Close: {result.get('latest_close', 'Unknown')}",
         f"Data Quality: {result.get('data_quality_report', {}).get('completed_row_count', 'Unknown')} "
         f"completed rows / {result.get('data_quality_report', {}).get('row_count', 'Unknown')} total rows",
         f"Trend: {result.get('trend', 'Unknown')}",
+        f"Trend Horizon: {result.get('trend_horizon', 'Unknown')}",
         f"Market State: {result.get('market_state', 'Unknown')}",
         f"Overall Bias: {result.get('overall_bias', 'Unknown')}",
         f"Bullish Score: {result.get('bullish_score', 'Unknown')}",
         f"Bearish Score: {result.get('bearish_score', 'Unknown')}",
         f"Rule Confidence: {result.get('rule_confidence', 'Unknown')}",
         f"Trend Score: {result.get('trend_score', 'Unknown')}",
+        f"Trend Signal Contribution: {result.get('trend_signal_score', 'Unknown')}",
         f"Pattern Score: {result.get('pattern_score', 'Unknown')}",
         f"Volume Score: {result.get('volume_score', 'Unknown')}",
         f"Net Signal Score: {result.get('net_signal_score', 'Unknown')}",
+        f"Short-Term Trend: {result.get('short_term_trend', 'Unknown')} ({result.get('short_term_trend_score', 'Unknown')})",
+        f"Medium-Term Trend: {result.get('medium_term_trend', 'Unknown')} ({result.get('medium_term_trend_score', 'Unknown')})",
+        f"Long-Term Trend: {result.get('long_term_trend', 'Unknown')} ({result.get('long_term_trend_score', 'Unknown')})",
         "Patterns:",
     ]
 
@@ -56,11 +61,9 @@ def format_analysis_text(
             lines.append(f"  Status: {pattern.get('status', 'confirmed')}")
             lines.append(f"  State: {pattern.get('event_state', 'unknown')}")
             lines.append(f"  Bias: {pattern['bias']}")
-            lines.append(f"  Pattern Start: {pattern.get('pattern_start_exchange', pattern['bar_start_exchange'])}")
-            lines.append(f"  Pattern Completion: {pattern.get('pattern_end_exchange', pattern['bar_end_exchange'])}")
-            lines.append(f"  Detected at: {pattern['detected_at_exchange']}")
-            lines.append(f"  Display Detected at: {pattern['detected_at_display']}")
-            lines.append(f"  Exchange Timezone: {pattern.get('exchange_timezone', 'Unknown')}")
+            lines.append(f"  Pattern Start: {pattern.get('pattern_start_display', pattern.get('bar_start_display', 'Unknown'))}")
+            lines.append(f"  Pattern Completion: {pattern.get('pattern_end_display', pattern.get('bar_end_display', 'Unknown'))}")
+            lines.append(f"  Detected at: {pattern['detected_at_display']}")
             lines.append(f"  Display Timezone: {pattern.get('display_timezone', 'Unknown')}")
             lines.append(f"  Signal Strength: {pattern.get('signal_strength', 'Unknown')}")
             lines.append(f"  Weighted Score: {pattern.get('weighted_score', 'Unknown')}")
@@ -80,6 +83,10 @@ def format_analysis_text(
     structured = result.get("structured_explanation") or {}
     lines.append("Explanation:")
     lines.append(f"  {structured.get('summary', result.get('explanation', ''))}")
+    if structured.get("trend_evidence"):
+        lines.append("Trend Evidence:")
+        for item in structured["trend_evidence"]:
+            lines.append(f"  - {item}")
     if structured.get("bullish_evidence"):
         lines.append("Bullish Evidence:")
         for item in structured["bullish_evidence"]:

@@ -1191,19 +1191,320 @@ def detect_patterns(
     return active_registry.detect(data, config, interval)
 
 
-def classify_intraday_trend(df: pd.DataFrame) -> pd.DataFrame:
-    """Classify the intraday trend from moving-average structure."""
-    pattern_df = df.copy()
-    pattern_df["Trend"] = np.select(
-        [
-            (pattern_df["Close"] > pattern_df["MA_20_Bars"])
-            & (pattern_df["MA_20_Bars"] > pattern_df["MA_50_Bars"]),
-            (pattern_df["Close"] < pattern_df["MA_20_Bars"])
-            & (pattern_df["MA_20_Bars"] < pattern_df["MA_50_Bars"]),
-        ],
-        ["Uptrend", "Downtrend"],
-        default="Neutral",
+@dataclass(frozen=True)
+class _TrendSnapshot:
+    score: float
+    label: str
+    evidence: list[str]
+
+
+def _trend_horizons(lookback_bars: int) -> tuple[int, int, int]:
+    short_horizon = max(12, min(20, lookback_bars))
+    medium_horizon = max(40, min(60, short_horizon * 4))
+    long_horizon = max(100, min(200, short_horizon * 10))
+    return short_horizon, medium_horizon, long_horizon
+
+
+def _trend_label(score: float) -> str:
+    if score >= 18.0:
+        return "Uptrend"
+    if score <= -18.0:
+        return "Downtrend"
+    return "Neutral"
+
+
+def _relative_move(reference: float, comparison: float, tolerance: float) -> int:
+    if comparison > reference * (1.0 + tolerance):
+        return 1
+    if comparison < reference * (1.0 - tolerance):
+        return -1
+    return 0
+
+
+def _confirmed_swings(
+    window: pd.DataFrame,
+    *,
+    pivot_left_bars: int,
+    pivot_right_bars: int,
+) -> tuple[list[tuple[int, float]], list[tuple[int, float]]]:
+    highs: list[tuple[int, float]] = []
+    lows: list[tuple[int, float]] = []
+    if len(window) < pivot_left_bars + pivot_right_bars + 1:
+        return highs, lows
+
+    for index in range(pivot_left_bars, len(window) - pivot_right_bars):
+        high_value = float(window.iloc[index]["High"])
+        low_value = float(window.iloc[index]["Low"])
+
+        high_slice = window["High"].iloc[index - pivot_left_bars : index + pivot_right_bars + 1]
+        low_slice = window["Low"].iloc[index - pivot_left_bars : index + pivot_right_bars + 1]
+
+        if high_value == float(high_slice.max()) and int((high_slice == high_value).sum()) == 1:
+            highs.append((index, high_value))
+        if low_value == float(low_slice.min()) and int((low_slice == low_value).sum()) == 1:
+            lows.append((index, low_value))
+
+    return highs, lows
+
+
+def _break_structure_score(
+    history: pd.DataFrame,
+    *,
+    breakout_lookback: int,
+) -> tuple[float, list[str]]:
+    evidence: list[str] = []
+    if len(history) < max(breakout_lookback + 1, 3):
+        return 0.0, evidence
+
+    recent_history = history.tail(max(6, min(12, breakout_lookback // 2 + 6))).reset_index(drop=True)
+    breakout_score = 0.0
+    for index in range(1, len(recent_history)):
+        previous_row = recent_history.iloc[index - 1]
+        row = recent_history.iloc[index]
+
+        current_prev_high = row.get("Rolling_High_20_Bars")
+        previous_prev_high = previous_row.get("Rolling_High_20_Bars")
+        current_prev_low = row.get("Rolling_Low_20_Bars")
+        previous_prev_low = previous_row.get("Rolling_Low_20_Bars")
+
+        if (
+            pd.notna(current_prev_high)
+            and pd.notna(previous_prev_high)
+            and row["Close"] > current_prev_high
+            and previous_row["Close"] <= previous_prev_high
+        ):
+            bars_ago = len(recent_history) - 1 - index
+            breakout_score = max(
+                breakout_score,
+                11.0 - (bars_ago * 2.0) + (2.0 if bool(row.get("Strong_Volume", False)) else 0.0),
+            )
+        if (
+            pd.notna(current_prev_low)
+            and pd.notna(previous_prev_low)
+            and row["Close"] < current_prev_low
+            and previous_row["Close"] >= previous_prev_low
+        ):
+            bars_ago = len(recent_history) - 1 - index
+            bearish_break_score = max(
+                4.0,
+                11.0 - (bars_ago * 2.0) + (2.0 if bool(row.get("Strong_Volume", False)) else 0.0),
+            )
+            breakout_score = min(
+                breakout_score,
+                -bearish_break_score,
+            )
+
+    if breakout_score >= 4.0:
+        evidence.append(
+            f"Price confirmed an upside break above the prior {breakout_lookback}-bar high."
+        )
+    elif breakout_score <= -4.0:
+        evidence.append(
+            f"Price confirmed a downside break below the prior {breakout_lookback}-bar low."
+        )
+    return breakout_score, evidence
+
+
+def _trend_snapshot(
+    history: pd.DataFrame,
+    *,
+    horizon: int,
+    pivot_left_bars: int,
+    pivot_right_bars: int,
+    breakout_lookback: int,
+) -> _TrendSnapshot:
+    window = history.tail(min(len(history), horizon)).reset_index(drop=True)
+    if len(window) < 8:
+        return _TrendSnapshot(score=0.0, label="Neutral", evidence=[])
+
+    closes = window["Close"].astype(float).to_numpy()
+    highs = window["High"].astype(float).to_numpy()
+    lows = window["Low"].astype(float).to_numpy()
+    returns = window["Bar_Return"].fillna(0.0).astype(float).to_numpy()
+    atr_scale = float(np.nanmean(highs - lows))
+    atr_scale = atr_scale if atr_scale > 1e-9 else max(abs(float(closes[-1])) * 0.001, 1e-6)
+
+    regression_x = np.arange(len(closes), dtype=float)
+    slope = float(np.polyfit(regression_x, closes, 1)[0])
+    slope_score = float(np.clip((slope / atr_scale) * 80.0, -24.0, 24.0))
+
+    fast_period = min(20, max(5, len(window) // 3))
+    slow_period = min(50, max(fast_period + 4, len(window)))
+    fast_ma = float(np.mean(closes[-fast_period:]))
+    slow_ma = float(np.mean(closes[-slow_period:]))
+    price = float(closes[-1])
+
+    ma_score = 0.0
+    ma_separation = abs(fast_ma - slow_ma) / atr_scale
+    if ma_separation >= 0.12:
+        if fast_ma > slow_ma:
+            ma_score += 10.0
+        elif fast_ma < slow_ma:
+            ma_score -= 10.0
+    if price > fast_ma and price > slow_ma:
+        ma_score += 5.0
+    elif price < fast_ma and price < slow_ma:
+        ma_score -= 5.0
+    if len(closes) >= slow_period + 3:
+        previous_fast = float(np.mean(closes[-fast_period - 3 : -3]))
+        previous_slow = float(np.mean(closes[-slow_period - 3 : -3]))
+        if fast_ma > previous_fast and slow_ma > previous_slow:
+            ma_score += 5.0
+        elif fast_ma < previous_fast and slow_ma < previous_slow:
+            ma_score -= 5.0
+
+    persistence_window = returns[-min(len(returns), max(8, horizon // 2)) :]
+    bullish_persistence = float(np.mean(persistence_window > 0))
+    bearish_persistence = float(np.mean(persistence_window < 0))
+    persistence_score = (bullish_persistence - bearish_persistence) * 18.0
+
+    swing_highs, swing_lows = _confirmed_swings(
+        window,
+        pivot_left_bars=pivot_left_bars,
+        pivot_right_bars=pivot_right_bars,
     )
+    swing_tolerance = max((atr_scale / max(abs(price), 1.0)) * 0.35, 0.0015)
+    swing_score = 0.0
+    if len(swing_highs) >= 2:
+        high_direction = _relative_move(swing_highs[-2][1], swing_highs[-1][1], swing_tolerance)
+        swing_score += 7.0 * high_direction
+    if len(swing_lows) >= 2:
+        low_direction = _relative_move(swing_lows[-2][1], swing_lows[-1][1], swing_tolerance)
+        swing_score += 7.0 * low_direction
+
+    break_score, break_evidence = _break_structure_score(
+        history,
+        breakout_lookback=breakout_lookback,
+    )
+    break_score *= 1.0 if horizon <= 60 else 0.5
+
+    raw_score = slope_score + ma_score + persistence_score + swing_score + break_score
+    score = float(np.clip(raw_score, -100.0, 100.0))
+
+    evidence: list[str] = []
+    if slope_score >= 6.0:
+        evidence.append("Recent close regression slope was positive after range normalization.")
+    elif slope_score <= -6.0:
+        evidence.append("Recent close regression slope was negative after range normalization.")
+
+    if ma_score >= 8.0:
+        evidence.append("Price and moving-average alignment stayed bullish across the recent horizon.")
+    elif ma_score <= -8.0:
+        evidence.append("Price and moving-average alignment stayed bearish across the recent horizon.")
+
+    if swing_score >= 7.0:
+        evidence.append("Confirmed swing highs and lows were progressing upward.")
+    elif swing_score <= -7.0:
+        evidence.append("Confirmed swing highs and lows were progressing downward.")
+
+    if persistence_score >= 4.0:
+        evidence.append("Directional persistence favored bullish closes over the recent bars.")
+    elif persistence_score <= -4.0:
+        evidence.append("Directional persistence favored bearish closes over the recent bars.")
+
+    evidence.extend(break_evidence)
+    return _TrendSnapshot(score=round(score, 2), label=_trend_label(score), evidence=evidence)
+
+
+def classify_intraday_trend(
+    df: pd.DataFrame,
+    *,
+    lookback_bars: int = 12,
+    pivot_left_bars: int = 2,
+    pivot_right_bars: int = 2,
+    breakout_lookback: int = 20,
+) -> pd.DataFrame:
+    """Classify the intraday trend using recency-aware structural components."""
+    pattern_df = df.copy()
+    short_horizon, medium_horizon, long_horizon = _trend_horizons(lookback_bars)
+    short_scores: list[float] = []
+    medium_scores: list[float] = []
+    long_scores: list[float] = []
+    short_labels: list[str] = []
+    medium_labels: list[str] = []
+    long_labels: list[str] = []
+    trend_scores: list[float] = []
+    trend_labels: list[str] = []
+    trend_evidence: list[list[str]] = []
+    trend_horizons: list[str] = []
+    trend_lookbacks: list[int] = []
+
+    for index in range(len(pattern_df)):
+        history = pattern_df.iloc[: index + 1].copy(deep=False)
+        short_snapshot = _trend_snapshot(
+            history,
+            horizon=short_horizon,
+            pivot_left_bars=pivot_left_bars,
+            pivot_right_bars=pivot_right_bars,
+            breakout_lookback=breakout_lookback,
+        )
+        medium_snapshot = _trend_snapshot(
+            history,
+            horizon=medium_horizon,
+            pivot_left_bars=pivot_left_bars,
+            pivot_right_bars=pivot_right_bars,
+            breakout_lookback=breakout_lookback,
+        )
+        long_snapshot = _trend_snapshot(
+            history,
+            horizon=long_horizon,
+            pivot_left_bars=pivot_left_bars,
+            pivot_right_bars=pivot_right_bars,
+            breakout_lookback=breakout_lookback,
+        )
+
+        weights: list[float] = []
+        weighted_scores: list[float] = []
+        available_snapshots = (
+            (short_snapshot, 0.50, short_horizon),
+            (medium_snapshot, 0.35, medium_horizon),
+            (long_snapshot, 0.15, long_horizon),
+        )
+        for snapshot, weight, horizon in available_snapshots:
+            if len(history) >= min(8, horizon):
+                weights.append(weight)
+                weighted_scores.append(snapshot.score * weight)
+
+        composite_score = round(sum(weighted_scores) / sum(weights), 2) if weights else 0.0
+        composite_label = _trend_label(composite_score)
+        evidence = list(dict.fromkeys(short_snapshot.evidence + medium_snapshot.evidence))
+        latest_row = history.iloc[-1]
+        if composite_label == "Downtrend" and bool(latest_row.get("Is_Bullish", False)):
+            evidence.append(
+                "A recent bullish candle was treated as a counter-trend reaction, not a confirmed reversal."
+            )
+        elif composite_label == "Uptrend" and bool(latest_row.get("Is_Bearish", False)):
+            evidence.append(
+                "A recent bearish candle was treated as a counter-trend reaction, not a confirmed reversal."
+            )
+        if not evidence:
+            evidence.append(
+                "Slope, moving averages, swing structure, and recent breaks were too mixed to confirm a trend."
+            )
+
+        short_scores.append(short_snapshot.score)
+        medium_scores.append(medium_snapshot.score)
+        long_scores.append(long_snapshot.score)
+        short_labels.append(short_snapshot.label)
+        medium_labels.append(medium_snapshot.label)
+        long_labels.append(long_snapshot.label)
+        trend_scores.append(composite_score)
+        trend_labels.append(composite_label)
+        trend_evidence.append(evidence)
+        trend_horizons.append("Short-to-medium term")
+        trend_lookbacks.append(medium_horizon)
+
+    pattern_df["Short_Term_Trend"] = short_labels
+    pattern_df["Medium_Term_Trend"] = medium_labels
+    pattern_df["Long_Term_Trend"] = long_labels
+    pattern_df["Short_Term_Trend_Score"] = short_scores
+    pattern_df["Medium_Term_Trend_Score"] = medium_scores
+    pattern_df["Long_Term_Trend_Score"] = long_scores
+    pattern_df["Trend"] = trend_labels
+    pattern_df["Trend_Score"] = trend_scores
+    pattern_df["Trend_Evidence"] = trend_evidence
+    pattern_df["Trend_Horizon"] = trend_horizons
+    pattern_df["Trend_Lookback_Bars"] = trend_lookbacks
     return pattern_df
 
 

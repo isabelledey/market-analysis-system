@@ -126,6 +126,7 @@ def test_no_pattern_analysis_outputs_neutral_scores() -> None:
     assert result["market_state"] in {"Trend Only", "Neutral"}
     assert set(result["structured_explanation"]) == {
         "summary",
+        "trend_evidence",
         "bullish_evidence",
         "bearish_evidence",
         "conflicts",

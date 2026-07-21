@@ -46,8 +46,8 @@ def test_incomplete_candle_is_removed_before_analysis() -> None:
     result = analyze_dataframe(df=df, symbol="TEST", as_of=as_of)
 
     assert result["latest_datetime"] == "2026-07-10T09:45-04:00"
-    assert result["latest_bar_start"] == "2026-07-10 16:45 Asia/Jerusalem"
-    assert result["latest_bar_end"] == "2026-07-10 17:00 Asia/Jerusalem"
+    assert result["latest_bar_start"] == "2026-07-10 16:45:00+0300 Asia/Jerusalem"
+    assert result["latest_bar_end"] == "2026-07-10 17:00:00+0300 Asia/Jerusalem"
 
 
 def test_raises_when_no_completed_candles_remain() -> None:
@@ -96,9 +96,9 @@ def test_timezone_conversion_uses_asia_jerusalem_for_display() -> None:
     )
 
     assert result["display_timezone"] == "Asia/Jerusalem"
-    assert engulfing["bar_start_display"] == "2026-07-10 22:30 Asia/Jerusalem"
-    assert engulfing["bar_end_display"] == "2026-07-10 22:45 Asia/Jerusalem"
-    assert engulfing["detected_at_display"] == "2026-07-10 22:45 Asia/Jerusalem"
+    assert engulfing["bar_start_display"] == "2026-07-10 22:30:00+0300 Asia/Jerusalem"
+    assert engulfing["bar_end_display"] == "2026-07-10 22:45:00+0300 Asia/Jerusalem"
+    assert engulfing["detected_at_display"] == "2026-07-10 22:45:00+0300 Asia/Jerusalem"
 
 
 def test_breakout_crossing_emits_one_event_not_repeated_events() -> None:

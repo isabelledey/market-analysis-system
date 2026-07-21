@@ -222,6 +222,12 @@ def test_cli_text_output(capsys: pytest.CaptureFixture[str]) -> None:
     assert "Pattern Start:" in captured.out
     assert "Detected at:" in captured.out
     assert "Family:" in captured.out
+    assert "Display Detected at:" not in captured.out
+    assert "EDT" not in captured.out
+    assert "EST" not in captured.out
+    assert "Latest Completed Candle Start:" in captured.out
+    assert "Asia/Jerusalem" in captured.out
+    assert "Detected at:" in captured.out
 
 
 def test_output_file_creation(tmp_path: Path) -> None:
