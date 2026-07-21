@@ -10,15 +10,191 @@ from typing import Any
 from stock_pattern_model.config import ScoringConfig
 from stock_pattern_model.datetime_utils import format_compact_display_datetime
 from stock_pattern_model.domain import DataQualityReport
+from stock_pattern_model.domain import PatternScoreEligibility
 
 
 EVENT_STATE_PRIORITY = {
     "new": 0,
-    "retested": 1,
-    "active": 2,
-    "failed": 3,
-    "expired": 4,
+    "retest_pending": 1,
+    "retest_rejected": 2,
+    "reclaimed": 3,
+    "awaiting_confirmation": 4,
+    "active": 5,
+    "retested": 6,
+    "invalidated": 7,
+    "failed_breakout": 8,
+    "failed_breakdown": 9,
+    "failed": 10,
+    "expired": 11,
 }
+
+INELIGIBLE_STATES = {
+    "awaiting_confirmation",
+    "expired",
+    "invalidated",
+    "failed",
+    "failed_breakout",
+    "failed_breakdown",
+    "reclaimed",
+}
+
+ACTIVE_SIGNAL_STATES = {
+    "new",
+    "active",
+    "retested",
+    "retest_pending",
+    "retest_rejected",
+}
+
+
+def _event_index(pattern: dict[str, Any], field_name: str) -> int | None:
+    value = pattern.get(field_name)
+    if value is None:
+        return None
+    return int(value)
+
+
+def _eligibility_anchor(pattern: dict[str, Any]) -> tuple[str, int | None]:
+    event_state = str(pattern.get("event_state") or "")
+    pattern_id = str(pattern.get("pattern_id") or "")
+
+    if event_state == "retest_rejected":
+        return "rejection", _event_index(pattern, "rejection_index")
+    if event_state == "retest_pending":
+        return "retest", _event_index(pattern, "retest_index")
+    if event_state == "reclaimed":
+        return "reclaimed", _event_index(pattern, "reclaimed_index")
+    if event_state in {"failed", "failed_breakout", "failed_breakdown"}:
+        return "failed", _event_index(pattern, "failed_index")
+    if event_state == "invalidated":
+        return "invalidated", _event_index(pattern, "invalidation_index")
+    if event_state == "expired":
+        return "expired", _event_index(pattern, "last_completed_candle_index")
+    if pattern_id in {"double_top", "double_bottom"}:
+        if pattern.get("status") == "tentative":
+            return "setup_completion", _event_index(pattern, "setup_completion_index")
+        confirmation_index = _event_index(pattern, "confirmation_index")
+        if confirmation_index is not None:
+            return "confirmation", confirmation_index
+    return "detected", _event_index(pattern, "detected_index")
+
+
+def pattern_max_age_bars(pattern: dict[str, Any], config: ScoringConfig) -> int:
+    event_state = str(pattern.get("event_state") or "")
+    if event_state == "awaiting_confirmation" or pattern.get("status") == "tentative":
+        return config.tentative_pattern_max_age_bars
+
+    pattern_id = str(pattern.get("pattern_id") or "")
+    family = str(pattern.get("pattern_family") or "")
+    if pattern_id in {"breakout", "breakdown"}:
+        return config.breakout_pattern_max_age_bars
+    if family in {"double_top", "double_bottom"}:
+        return config.structural_pattern_max_age_bars
+    if family in {"inside_bar", "inside_bar_failure"}:
+        return config.consolidation_pattern_max_age_bars
+    if family in {"pin_bar", "engulfing", "star", "doji"}:
+        return config.reversal_pattern_max_age_bars
+    return config.pattern_max_age_bars
+
+
+def evaluate_pattern_eligibility(
+    pattern: dict[str, Any],
+    config: ScoringConfig,
+) -> PatternScoreEligibility:
+    anchor_type, anchor_index = _eligibility_anchor(pattern)
+    detection_age = int(pattern.get("candles_ago", 0))
+    detected_index = _event_index(pattern, "detected_index")
+    last_completed_index = _event_index(pattern, "last_completed_candle_index")
+    if anchor_index is None or detected_index is None or last_completed_index is None:
+        age_bars = detection_age
+    else:
+        age_bars = max(0, last_completed_index - anchor_index)
+
+    max_age_bars = pattern_max_age_bars(pattern, config)
+    event_state = str(pattern.get("event_state") or "")
+    status = str(pattern.get("status") or "")
+    bias = str(pattern.get("bias") or "")
+
+    if pattern.get("dependency_suppressed"):
+        return PatternScoreEligibility(False, "linked confirmation duplicate", anchor_type, anchor_index, age_bars, max_age_bars)
+    if pattern.get("group_suppressed"):
+        return PatternScoreEligibility(False, "overlap duplicate", anchor_type, anchor_index, age_bars, max_age_bars)
+    if bias == "Neutral":
+        return PatternScoreEligibility(False, "informational only", anchor_type, anchor_index, age_bars, max_age_bars)
+    if event_state == "awaiting_confirmation":
+        return PatternScoreEligibility(False, "awaiting neckline confirmation", anchor_type, anchor_index, age_bars, max_age_bars)
+    if event_state in INELIGIBLE_STATES:
+        state_reason_map = {
+            "expired": "expired",
+            "invalidated": "invalidated",
+            "failed": "failed pattern",
+            "failed_breakout": "failed breakout",
+            "failed_breakdown": "failed breakdown",
+            "reclaimed": "level reclaimed",
+        }
+        return PatternScoreEligibility(False, state_reason_map[event_state], anchor_type, anchor_index, age_bars, max_age_bars)
+    if status == "tentative":
+        return PatternScoreEligibility(False, "unconfirmed structural pattern", anchor_type, anchor_index, age_bars, max_age_bars)
+    if status == "failed":
+        return PatternScoreEligibility(False, "failed pattern", anchor_type, anchor_index, age_bars, max_age_bars)
+    if status == "expired":
+        return PatternScoreEligibility(False, "expired", anchor_type, anchor_index, age_bars, max_age_bars)
+    if age_bars > max_age_bars:
+        return PatternScoreEligibility(False, "outside scoring horizon", anchor_type, anchor_index, age_bars, max_age_bars)
+    return PatternScoreEligibility(True, None, anchor_type, anchor_index, age_bars, max_age_bars)
+
+
+def build_event_id(pattern: dict[str, Any]) -> str:
+    event = pattern["event"]
+    return (
+        f"{pattern['pattern_id']}:{pattern['status']}:"
+        f"{event.detected_at.isoformat()}:{'-'.join(map(str, event.relevant_indices))}"
+    )
+
+
+def build_setup_id(pattern: dict[str, Any]) -> str:
+    event = pattern["event"]
+    return (
+        f"{pattern['pattern_id']}:{event.pattern_start_at.isoformat()}:"
+        f"{event.pattern_end_at.isoformat()}:{pattern['bias']}"
+    )
+
+
+def build_evidence_group(pattern: dict[str, Any]) -> str:
+    event = pattern["event"]
+    relevant_prices = event.relevant_prices
+    if pattern["pattern_family"] in {"pin_bar", "doji", "star"}:
+        return f"candlestick:{event.bar_start_at.isoformat()}"
+    if pattern["pattern_id"] == "breakout":
+        key_price = relevant_prices.get("breakout_level") or relevant_prices.get("confirmation_price") or 0.0
+        return f"breakout:{event.detected_at.isoformat()}:{round(float(key_price), 2)}"
+    if pattern["pattern_id"] == "breakdown":
+        key_price = relevant_prices.get("breakdown_level") or relevant_prices.get("confirmation_price") or 0.0
+        return f"breakdown:{event.detected_at.isoformat()}:{round(float(key_price), 2)}"
+    if pattern["pattern_id"] in {"double_top", "double_bottom"}:
+        setup_completion = event.setup_completion_at or event.pattern_end_at
+        neckline = relevant_prices.get("neckline") or relevant_prices.get("confirmation_price") or 0.0
+        return (
+            f"structural:{pattern['pattern_id']}:{pattern['bias']}:"
+            f"{setup_completion.isoformat()}:{round(float(neckline), 2)}"
+        )
+    if pattern["pattern_family"] == "engulfing":
+        return (
+            f"engulfing:{pattern['bias']}:{event.pattern_start_at.isoformat()}:"
+            f"{event.pattern_end_at.isoformat()}"
+        )
+    if pattern["pattern_family"] in {"inside_bar", "inside_bar_failure"}:
+        return f"inside_structure:{pattern['bias']}:{event.pattern_end_at.isoformat()}"
+    key_price = (
+        relevant_prices.get("confirmation_price")
+        or relevant_prices.get("breakout_level")
+        or relevant_prices.get("breakdown_level")
+        or 0.0
+    )
+    return (
+        f"{pattern['pattern_id']}:{pattern['bias']}:{event.detected_at.isoformat()}:"
+        f"{round(float(key_price), 2)}"
+    )
 
 
 @dataclass(frozen=True)
@@ -113,30 +289,71 @@ class ScoringService:
         enriched = [dict(pattern) for pattern in patterns]
         for pattern in enriched:
             event = pattern["event"]
-            pattern["event_id"] = self._build_event_id(pattern)
-            pattern["setup_id"] = self._build_setup_id(pattern)
-            pattern["evidence_group"] = self._build_evidence_group(pattern)
-            pattern["recency_weight"] = self._recency_weight(pattern["candles_ago"])
-            pattern["event_state"] = self._base_event_state(pattern)
-            pattern["score_eligible"] = bool(pattern["score_eligible"]) and pattern["recency_weight"] > 0
+            pattern["event_id"] = pattern.get("event_id") or build_event_id(pattern)
+            pattern["setup_id"] = pattern.get("setup_id") or build_setup_id(pattern)
+            pattern["evidence_group"] = pattern.get("evidence_group") or build_evidence_group(pattern)
+            pattern["event_state"] = pattern.get("event_state") or self._base_event_state(pattern)
+            decision = evaluate_pattern_eligibility(pattern, self.config)
+            pattern["score_eligibility"] = decision.to_dict()
+            pattern["score_anchor_type"] = decision.anchor_type
+            pattern["score_anchor_index"] = decision.anchor_index
+            pattern["score_anchor_candles_ago"] = decision.age_bars
+            pattern["score_max_age_bars"] = decision.max_age_bars
+            pattern["recency_weight"] = self._recency_weight(
+                decision.age_bars,
+                max_age_bars=decision.max_age_bars,
+            )
+            pattern["score_eligible"] = bool(pattern.get("score_eligible", True)) and decision.eligible
+            pattern["weighted_score"] = round(abs(self._raw_pattern_score(pattern)), 2)
+            pattern["score_ineligibility_reason"] = decision.reason
             pattern["volume_score_contribution"] = 0.0
             pattern["pattern_score_contribution"] = 0.0
             pattern["group_primary"] = False
             pattern["group_suppressed"] = False
+            pattern["dependency_suppressed"] = False
             pattern["event_detected_display"] = pattern.get("detected_at_display")
             pattern["event_timestamp"] = event.detected_at
 
-        groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for pattern in enriched:
-            if pattern["event_state"] not in {"failed", "expired"}:
-                groups[pattern["evidence_group"]].append(pattern)
-
-        for group_patterns in groups.values():
-            group_patterns.sort(key=lambda item: (item["candles_ago"], -abs(item["weighted_score"])))
-            if len(group_patterns) > 1 and group_patterns[0]["event_state"] in {"new", "active"}:
-                group_patterns[0]["event_state"] = "retested"
-
+        self._infer_structural_relationships(enriched)
         return enriched
+
+    def _infer_structural_relationships(self, patterns: list[dict[str, Any]]) -> None:
+        structural_to_trigger = {
+            "double_top": "breakdown",
+            "double_bottom": "breakout",
+        }
+        for pattern in patterns:
+            trigger_id = structural_to_trigger.get(pattern["pattern_id"])
+            if trigger_id is None or pattern.get("related_event_ids"):
+                continue
+            reference_level = self._relationship_level(pattern)
+            if reference_level is None:
+                continue
+            for candidate in patterns:
+                if candidate["pattern_id"] != trigger_id:
+                    continue
+                if candidate["event"].detected_at != pattern["event"].detected_at:
+                    continue
+                candidate_level = self._relationship_level(candidate)
+                if candidate_level is None:
+                    continue
+                tolerance = max(abs(reference_level) * 0.01, 0.5)
+                if abs(candidate_level - reference_level) > tolerance:
+                    continue
+                pattern["related_event_ids"] = [candidate["event_id"]]
+                pattern["relationship_type"] = "confirmed_by"
+                candidate["related_event_ids"] = [pattern["event_id"]]
+                candidate["relationship_type"] = "confirms"
+                candidate["confirms_pattern_id"] = pattern["event_id"]
+                break
+
+    def _relationship_level(self, pattern: dict[str, Any]) -> float | None:
+        prices = pattern["event"].relevant_prices
+        for key in ("neckline", "confirmation_price", "breakout_level", "breakdown_level"):
+            value = prices.get(key)
+            if value is not None:
+                return float(value)
+        return None
 
     def _group_primary_patterns(
         self,
@@ -152,8 +369,9 @@ class ScoringService:
             ranked_group = sorted(
                 group_patterns,
                 key=lambda item: (
+                    item["status"] != "confirmed",
                     -abs(self._raw_pattern_score(item)),
-                    item["candles_ago"],
+                    item.get("score_anchor_candles_ago", item["candles_ago"]),
                     item["priority"],
                 ),
             )
@@ -165,12 +383,91 @@ class ScoringService:
 
             for pattern in ranked_group[1:]:
                 pattern["group_suppressed"] = True
+                pattern["score_eligible"] = False
+                pattern["score_ineligibility_reason"] = "overlap duplicate"
+                pattern["score_eligibility"] = PatternScoreEligibility(
+                    eligible=False,
+                    reason="overlap duplicate",
+                    anchor_type=str(pattern.get("score_anchor_type", "detected")),
+                    anchor_index=pattern.get("score_anchor_index"),
+                    age_bars=int(pattern.get("score_anchor_candles_ago", pattern["candles_ago"])),
+                    max_age_bars=int(pattern.get("score_max_age_bars", self.config.pattern_max_age_bars)),
+                ).to_dict()
                 suppressed_patterns.append(pattern)
+
+        primary_patterns, dependency_suppressed = self._apply_dependency_suppression(primary_patterns)
+        suppressed_patterns.extend(dependency_suppressed)
 
         return {
             "primary_patterns": primary_patterns,
             "suppressed_patterns": suppressed_patterns,
         }
+
+    def _apply_dependency_suppression(
+        self,
+        primary_patterns: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        by_event_id = {pattern["event_id"]: pattern for pattern in primary_patterns}
+        retained: list[dict[str, Any]] = []
+        suppressed: list[dict[str, Any]] = []
+        visited: set[str] = set()
+
+        for pattern in sorted(
+            primary_patterns,
+            key=lambda item: (
+                -abs(self._raw_pattern_score(item)),
+                item.get("score_anchor_candles_ago", item["candles_ago"]),
+                item["pattern_name"],
+            ),
+        ):
+            event_id = pattern["event_id"]
+            if event_id in visited:
+                continue
+            cluster_ids = {event_id, *(pattern.get("related_event_ids") or [])}
+            cluster = [by_event_id[item] for item in cluster_ids if item in by_event_id]
+            if len(cluster) == 1:
+                retained.append(pattern)
+                visited.add(event_id)
+                continue
+
+            ranked_cluster = sorted(
+                cluster,
+                key=lambda item: (
+                    item.get("relationship_type") != "confirmed_by",
+                    -abs(self._raw_pattern_score(item)),
+                    item.get("score_anchor_candles_ago", item["candles_ago"]),
+                    item["pattern_name"],
+                ),
+            )
+            winner = ranked_cluster[0]
+            retained.append(winner)
+            for item in ranked_cluster:
+                visited.add(item["event_id"])
+                if item["event_id"] == winner["event_id"]:
+                    continue
+                item["dependency_suppressed"] = True
+                item["group_primary"] = False
+                item["score_eligible"] = False
+                item["score_ineligibility_reason"] = "linked confirmation duplicate"
+                item["score_eligibility"] = PatternScoreEligibility(
+                    eligible=False,
+                    reason="linked confirmation duplicate",
+                    anchor_type=str(item.get("score_anchor_type", "detected")),
+                    anchor_index=item.get("score_anchor_index"),
+                    age_bars=int(item.get("score_anchor_candles_ago", item["candles_ago"])),
+                    max_age_bars=int(item.get("score_max_age_bars", self.config.pattern_max_age_bars)),
+                ).to_dict()
+                suppressed.append(item)
+
+        retained_sorted = sorted(
+            retained,
+            key=lambda item: (
+                item.get("score_anchor_candles_ago", item["candles_ago"]),
+                item["priority"],
+                item["pattern_name"],
+            ),
+        )
+        return retained_sorted, suppressed
 
     def _calculate_scores(
         self,
@@ -216,12 +513,15 @@ class ScoringService:
         active_patterns = [
             pattern
             for pattern in primary_patterns
-            if pattern["event_state"] in {"new", "active", "retested"}
+            if pattern["event_state"] in ACTIVE_SIGNAL_STATES
         ]
         if not active_patterns:
             return "Trend Only" if trend != "Neutral" else "Neutral"
 
-        latest_pattern = min(active_patterns, key=lambda item: item["candles_ago"])
+        latest_pattern = min(
+            active_patterns,
+            key=lambda item: item.get("score_anchor_candles_ago", item["candles_ago"]),
+        )
         bullish_score = score["bullish_score"]
         bearish_score = score["bearish_score"]
         conflict_ratio = self._conflict_ratio(bullish_score, bearish_score)
@@ -230,14 +530,25 @@ class ScoringService:
             return "Conflicted"
         if (
             latest_pattern["pattern_id"] == "breakout"
-            and latest_pattern["candles_ago"] <= self.config.breakout_state_max_age_bars
+            and latest_pattern.get("score_anchor_candles_ago", latest_pattern["candles_ago"]) <= self.config.breakout_state_max_age_bars
         ):
             return "Breakout Attempt"
         if (
             latest_pattern["pattern_id"] == "breakdown"
-            and latest_pattern["candles_ago"] <= self.config.breakout_state_max_age_bars
+            and latest_pattern.get("score_anchor_candles_ago", latest_pattern["candles_ago"]) <= self.config.breakout_state_max_age_bars
         ):
-            return "Breakdown Attempt"
+            if latest_pattern["event_state"] == "retest_pending":
+                return "Bearish Continuation Under Retest"
+            if trend == "Downtrend":
+                return "Breakdown Attempt"
+        if trend == "Downtrend" and any(
+            pattern["pattern_id"] in {"bullish_pin_bar", "hammer", "double_bottom"} for pattern in active_patterns
+        ):
+            return "Bearish Trend with Bullish Reversal Attempt"
+        if trend == "Uptrend" and any(
+            pattern["pattern_id"] in {"shooting_star", "double_top"} for pattern in active_patterns
+        ):
+            return "Bullish Trend with Bearish Reversal Attempt"
         if trend == "Uptrend" and score["pattern_score"] > 0:
             return "Bullish Continuation"
         if trend == "Downtrend" and score["pattern_score"] < 0:
@@ -261,7 +572,7 @@ class ScoringService:
         confirmed_patterns = [
             pattern
             for pattern in primary_patterns
-            if pattern["status"] == "confirmed"
+            if pattern["status"] == "confirmed" and pattern["score_eligible"]
         ]
         directional_confirmed_patterns = [
             pattern
@@ -293,7 +604,7 @@ class ScoringService:
         confirmed_patterns = [
             pattern
             for pattern in primary_patterns
-            if pattern["status"] == "confirmed"
+            if pattern["status"] == "confirmed" and pattern["score_eligible"]
         ]
         if not confirmed_patterns:
             return 12.0 if trend != "Neutral" else 5.0
@@ -384,9 +695,16 @@ class ScoringService:
                 "Bullish and bearish confirmed evidence were both present, so the net signal was tempered."
             )
         if suppressed_patterns:
-            conflicts.append(
-                f"{len(suppressed_patterns)} overlapping pattern event(s) were grouped to avoid double counting."
-            )
+            overlap_count = sum(1 for pattern in suppressed_patterns if pattern.get("group_suppressed"))
+            dependency_count = sum(1 for pattern in suppressed_patterns if pattern.get("dependency_suppressed"))
+            if overlap_count:
+                conflicts.append(
+                    f"{overlap_count} overlapping candle label(s) were grouped into shared canonical candle events to avoid double counting."
+                )
+            if dependency_count:
+                conflicts.append(
+                    f"{dependency_count} linked structural setup(s) or confirmation trigger(s) were kept as separate events, and dependency-aware scoring prevented double counting."
+                )
 
         if overall_bias == "Bullish":
             reason_for_bias = (
@@ -479,46 +797,13 @@ class ScoringService:
             f"detected at {detected_at} with {pattern['detection_reason']}"
         )
 
-    def _build_event_id(self, pattern: dict[str, Any]) -> str:
-        event = pattern["event"]
-        return (
-            f"{pattern['pattern_id']}:{pattern['status']}:"
-            f"{event.detected_at.isoformat()}:{'-'.join(map(str, event.relevant_indices))}"
-        )
-
-    def _build_setup_id(self, pattern: dict[str, Any]) -> str:
-        event = pattern["event"]
-        return (
-            f"{pattern['pattern_id']}:{event.pattern_start_at.isoformat()}:"
-            f"{event.pattern_end_at.isoformat()}:{pattern['bias']}"
-        )
-
-    def _build_evidence_group(self, pattern: dict[str, Any]) -> str:
-        event = pattern["event"]
-        relevant_prices = event.relevant_prices
-        if pattern["pattern_id"] in {"breakout", "double_bottom"}:
-            return f"upside_break:{event.detected_at.isoformat()}"
-        if pattern["pattern_id"] in {"breakdown", "double_top"}:
-            return f"downside_break:{event.detected_at.isoformat()}"
-        if pattern["pattern_family"] in {"pin_bar", "doji", "star"}:
-            return f"candlestick:{event.bar_start_at.isoformat()}"
-        if pattern["pattern_family"] == "engulfing":
-            return f"engulfing:{pattern['bias']}:{event.pattern_start_at.isoformat()}:{event.pattern_end_at.isoformat()}"
-        if pattern["pattern_family"] in {"inside_bar", "inside_bar_failure"}:
-            return f"inside_structure:{pattern['bias']}:{event.pattern_end_at.isoformat()}"
-        key_price = (
-            relevant_prices.get("confirmation_price")
-            or relevant_prices.get("breakout_level")
-            or relevant_prices.get("breakdown_level")
-            or 0.0
-        )
-        return f"{pattern['pattern_id']}:{pattern['bias']}:{event.detected_at.isoformat()}:{round(float(key_price), 2)}"
-
     def _base_event_state(self, pattern: dict[str, Any]) -> str:
+        if pattern["pattern_id"] in {"double_top", "double_bottom"} and pattern["status"] == "tentative":
+            return "awaiting_confirmation"
         status = pattern["status"]
         if status == "failed":
             return "failed"
-        if status == "expired" or pattern["candles_ago"] > self.config.state_expiration_bars:
+        if status == "expired" or pattern["candles_ago"] > pattern_max_age_bars(pattern, self.config):
             return "expired"
         if pattern["candles_ago"] <= 1:
             return "new"
@@ -539,8 +824,9 @@ class ScoringService:
         direction = 1.0 if pattern["bias"] == "Bullish" else -1.0 if pattern["bias"] == "Bearish" else 0.0
         return direction * self.config.volume_confirmation_bonus * pattern["recency_weight"]
 
-    def _recency_weight(self, candles_ago: int) -> float:
-        if candles_ago > self.config.pattern_max_age_bars:
+    def _recency_weight(self, candles_ago: int, *, max_age_bars: int | None = None) -> float:
+        effective_max_age = self.config.pattern_max_age_bars if max_age_bars is None else max_age_bars
+        if candles_ago > effective_max_age:
             return 0.0
         return round(self.config.recency_decay ** candles_ago, 4)
 

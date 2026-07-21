@@ -11,9 +11,11 @@ from stock_pattern_model.domain import PatternFamily
 from stock_pattern_model.domain import PatternStatus
 from stock_pattern_model.features import add_features
 from stock_pattern_model.pattern_detector import BasePatternDetector
+from stock_pattern_model.pattern_detector import BullishEngulfingDetector
 from stock_pattern_model.pattern_detector import BearishEngulfingDetector
 from stock_pattern_model.pattern_detector import BreakdownDetector
 from stock_pattern_model.pattern_detector import BreakoutDetector
+from stock_pattern_model.pattern_detector import classify_intraday_trend
 from stock_pattern_model.pattern_detector import DEFAULT_PATTERN_REGISTRY
 from stock_pattern_model.pattern_detector import DojiDetector
 from stock_pattern_model.pattern_detector import DoubleBottomDetector
@@ -114,6 +116,50 @@ def test_morning_star_detection_timestamp_and_no_future_data_use() -> None:
     assert event.relevant_indices == [2, 3, 4]
 
 
+def test_multi_candle_patterns_do_not_cross_sessions() -> None:
+    engulfing_df = pd.concat(
+        [
+            make_df(
+                [
+                    candle(open_price=101.2, high_price=101.3, low_price=99.7, close_price=99.9, volume=2800),
+                ],
+                start="2026-07-10 15:45",
+            ),
+            make_df(
+                [
+                    candle(open_price=99.8, high_price=101.6, low_price=99.7, close_price=101.2, volume=2900),
+                ],
+                start="2026-07-13 09:30",
+            ),
+        ],
+        ignore_index=True,
+    )
+    morning_star_df = pd.concat(
+        [
+            make_df(
+                [
+                    candle(open_price=101.2, high_price=101.3, low_price=99.7, close_price=99.9, volume=2800),
+                    candle(open_price=99.95, high_price=100.05, low_price=99.6, close_price=99.9, volume=1400),
+                ],
+                start="2026-07-10 15:30",
+            ),
+            make_df(
+                [
+                    candle(open_price=99.95, high_price=101.4, low_price=99.9, close_price=100.8, volume=2600),
+                ],
+                start="2026-07-13 09:30",
+            ),
+        ],
+        ignore_index=True,
+    )
+
+    engulfing_events = BullishEngulfingDetector().detect(add_features(engulfing_df), PatternConfig(), "15m")
+    morning_star_events = MorningStarDetector().detect(add_features(morning_star_df), PatternConfig(), "15m")
+
+    assert engulfing_events == []
+    assert morning_star_events == []
+
+
 def test_breakout_strong_event_remains_single_event() -> None:
     df = make_base_df(30)
     df.loc[20, ["Open", "High", "Low", "Close", "Volume"]] = [100.10, 101.20, 100.00, 100.90, 2600]
@@ -125,6 +171,71 @@ def test_breakout_strong_event_remains_single_event() -> None:
     assert len(events) == 1
     assert events[0].pattern_name == "Strong 20-Bar Breakout"
     assert events[0].strength_label == "strong"
+
+
+def test_breakout_detection_does_not_use_future_bars_for_earlier_event() -> None:
+    prefix = make_base_df(22)
+    prefix.loc[20, ["Open", "High", "Low", "Close", "Volume"]] = [100.10, 101.20, 100.00, 100.90, 1200]
+    prefix.loc[21, ["Open", "High", "Low", "Close", "Volume"]] = [100.80, 101.10, 100.70, 100.95, 1100]
+
+    full = pd.concat(
+        [
+            prefix,
+            make_df(
+                [
+                    candle(120.0, 140.0, 80.0, 130.0, 9000),
+                    candle(130.0, 141.0, 79.0, 129.0, 8800),
+                ],
+                start="2026-07-10 15:00",
+            ),
+        ],
+        ignore_index=True,
+    )
+
+    prefix_events = BreakoutDetector().detect(add_features(prefix), PatternConfig(), "15m")
+    full_events = BreakoutDetector().detect(add_features(full), PatternConfig(), "15m")
+
+    assert prefix_events
+    assert full_events
+    assert prefix_events[0].detected_at == full_events[0].detected_at
+    assert prefix_events[0].relevant_prices["breakout_level"] == full_events[0].relevant_prices["breakout_level"]
+
+
+def test_breakout_cooldown_requires_reset_before_second_event() -> None:
+    df = make_base_df(30)
+    df.loc[20, ["Open", "High", "Low", "Close", "Volume"]] = [100.10, 101.20, 100.00, 100.90, 2600]
+    df.loc[21, ["Open", "High", "Low", "Close", "Volume"]] = [100.92, 101.15, 100.85, 100.95, 1200]
+    df.loc[22, ["Open", "High", "Low", "Close", "Volume"]] = [100.96, 101.12, 100.88, 101.00, 1180]
+    df.loc[23, ["Open", "High", "Low", "Close", "Volume"]] = [100.98, 101.10, 100.90, 100.98, 1160]
+    df.loc[24, ["Open", "High", "Low", "Close", "Volume"]] = [101.00, 101.45, 100.96, 101.35, 2400]
+
+    events = BreakoutDetector().detect(add_features(df), PatternConfig(), "15m")
+
+    assert len(events) == 1
+
+
+def test_breakout_reset_allows_second_event_after_pullback() -> None:
+    df = make_base_df(30)
+    df.loc[20, ["Open", "High", "Low", "Close", "Volume"]] = [100.10, 101.20, 100.00, 100.90, 2600]
+    df.loc[21, ["Open", "High", "Low", "Close", "Volume"]] = [100.88, 100.92, 100.40, 100.60, 1200]
+    df.loc[22, ["Open", "High", "Low", "Close", "Volume"]] = [100.58, 100.72, 100.45, 100.55, 1150]
+    df.loc[23, ["Open", "High", "Low", "Close", "Volume"]] = [100.56, 100.75, 100.50, 100.62, 1180]
+    df.loc[24, ["Open", "High", "Low", "Close", "Volume"]] = [100.70, 101.45, 100.68, 101.35, 2400]
+
+    events = BreakoutDetector().detect(add_features(df), PatternConfig(), "15m")
+
+    assert len(events) == 2
+
+
+def test_strong_breakout_can_be_classified_from_range_strength_without_strong_volume() -> None:
+    df = make_base_df(30)
+    df.loc[20, ["Open", "High", "Low", "Close", "Volume"]] = [100.10, 101.80, 100.00, 101.50, 1100]
+
+    events = BreakoutDetector().detect(add_features(df), PatternConfig(), "15m")
+
+    assert len(events) == 1
+    assert events[0].strength_label == "strong"
+    assert events[0].pattern_name == "Strong 20-Bar Breakout"
 
 
 def test_additional_pattern_detectors_emit_expected_events() -> None:
@@ -294,6 +405,25 @@ def test_configurable_tolerance_changes_double_top_detection() -> None:
 
     assert strict_events == []
     assert any(event.status is PatternStatus.TENTATIVE for event in tolerant_events)
+
+
+def test_trend_break_structure_uses_configured_lookback_not_hardcoded_twenty_bars() -> None:
+    df = make_base_df(10)
+    for index in range(5):
+        df.loc[index, ["Open", "High", "Low", "Close", "Volume"]] = [100.0, 100.4, 99.8, 100.1, 1000]
+    df.loc[5, ["Open", "High", "Low", "Close", "Volume"]] = [100.1, 101.2, 100.0, 101.0, 1800]
+    df.loc[6, ["Open", "High", "Low", "Close", "Volume"]] = [101.0, 101.4, 100.9, 101.2, 1200]
+    feature_df = add_features(df)
+
+    classified = classify_intraday_trend(
+        feature_df,
+        lookback_bars=8,
+        pivot_left_bars=2,
+        pivot_right_bars=2,
+        breakout_lookback=5,
+    )
+
+    assert any("prior 5-bar high" in item.lower() for item in classified.iloc[-1]["Trend_Evidence"])
 
 
 def test_registry_can_add_detector_without_editing_main_analysis_service() -> None:

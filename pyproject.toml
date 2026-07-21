@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stock-pattern-model"
+version = "0.1.0"
+description = "Rule-based intraday stock-pattern analysis with structured scoring and historical evaluation."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "yfinance",
+  "pandas",
+  "numpy",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,4 +1,2 @@
-yfinance
-pandas
-numpy
-pytest
+# Authoritative dependencies live in pyproject.toml.
+-e .[dev]

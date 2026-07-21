@@ -13,24 +13,21 @@ This project currently supports:
 - Ticker analysis and Israeli security-number resolution through a CSV mapping file
 - A registry-based pattern system with confirmed, tentative, failed, and expired events
 - Structured scoring, market-state logic, and human-readable explanations
+- Separate historical evaluation and backtesting metrics for forward returns, MFE, MAE, target-versus-stop outcomes, and grouped performance summaries
 
 This project does **not** currently include:
 
 - Brokerage integration
 - Live order execution
 - Portfolio management
-- Historical trading simulation
-- Backtesting
 - Paper trading
-- Stop-loss order simulation
-- Take-profit order simulation
-- Trade-level profit and loss calculations
+- Portfolio-level trading simulation
 - Portfolio equity curves
 - Sharpe-ratio calculations
 - Guaranteed market predictions
 - Statistically calibrated success probabilities
 
-Backtesting and trading simulation were not implemented in this project version.
+Historical signal evaluation is implemented, but portfolio simulation and live execution are not.
 
 Supported Python version: `Python 3.9+`
 
@@ -38,15 +35,22 @@ Supported Python version: `Python 3.9+`
 
 ```bash
 cd stock-pattern-model
-python3 -m pip install -r requirements.txt
+python3 -m pip install -e .[dev]
 ```
+
+`pyproject.toml` is the authoritative dependency definition. `requirements.txt` is only a thin convenience wrapper that installs the package with its `dev` extras.
 
 ## Package Usage
 
 The package exposes analysis and provider APIs without doing any work at import time:
 
 ```python
-from stock_pattern_model import analyze_dataframe, analyze_stock
+from stock_pattern_model import (
+    analyze_dataframe,
+    analyze_stock,
+    evaluate_historical_dataframe,
+    evaluate_historical_stock,
+)
 ```
 
 Importing `main` or `stock_pattern_model` does not trigger analysis, network calls, or terminal output.
@@ -71,6 +75,8 @@ python3 main.py analyze AAPL
 ```
 
 `main.py` is only a thin compatibility wrapper around the packaged CLI. It does not implement a separate analysis flow.
+
+Legacy root-level compatibility modules such as `model.py`, `pattern_detector.py`, `features.py`, and `data_loader.py` remain importable for backward compatibility, but they are deprecated wrappers around the packaged modules in `stock_pattern_model/`.
 
 ## Analysis Usage
 
@@ -152,6 +158,14 @@ Choose a display timezone:
 python3 -m stock_pattern_model analyze AAPL --display-timezone Asia/Jerusalem
 ```
 
+Choose a session mode:
+
+```bash
+python3 -m stock_pattern_model analyze AAPL --session-mode regular
+python3 -m stock_pattern_model analyze AAPL --session-mode extended
+python3 -m stock_pattern_model analyze AAPL --session-mode regular-and-afterhours
+```
+
 Provide an explicit `as_of`:
 
 ```bash
@@ -159,6 +173,13 @@ python3 -m stock_pattern_model analyze AAPL --as-of 2026-07-10T16:46:00-04:00
 ```
 
 Empty interactive input is rejected with a nonzero exit code. The CLI never falls back to a hardcoded default symbol or batch list.
+
+The packaged CLI defaults to:
+
+- `--display-timezone Asia/Jerusalem`
+- `--session-mode regular`
+
+Lower-level library helpers such as `analyze_dataframe()` keep their broader historical default behavior unless you explicitly pass a session mode.
 
 ## Market-Data Layer
 
@@ -186,6 +207,8 @@ Required canonical columns:
 
 Common case and naming variations are normalized when unambiguous, such as `timestamp`, `open`, and `volume`.
 
+Provider loading, validation, session filtering, analysis, and reporting now share one authoritative `AnalysisContext`, so exchange timezone, display timezone, session mode, and regular-session boundaries are not reconstructed independently in each layer.
+
 Offline analysis:
 
 ```bash
@@ -202,6 +225,7 @@ python3 -m stock_pattern_model analyze TEST \
 - Configurable cache directory
 - Configurable cache expiration through `--cache-ttl`
 - Cache bypass through `--no-cache`
+- Cache keys that include the effective session interpretation, exchange timezone, and validation mode
 
 Cached data is not committed to the repository and should stay outside versioned fixtures.
 
@@ -436,6 +460,65 @@ Also note:
 - Conflicting evidence can reduce the final bias
 - Neutral output should not be interpreted as a strong recommendation
 
+Current and historical evidence are separated in the final output:
+
+- `current_relevant_patterns`: active evidence still relevant to the latest score or lifecycle state
+- `session_pattern_history`: historical detections from the relevant exchange session
+- `all_detected_patterns`: the complete detected-label list, including suppressed overlaps and historical labels
+
+Serialized pattern and canonical-event output also exposes invalidation guidance, such as the completed-close level that would invalidate a breakout, breakdown, or reversal setup.
+
+## Historical Evaluation
+
+Historical evaluation is intentionally separate from live heuristic scoring.
+
+Package APIs:
+
+```python
+from stock_pattern_model import (
+    HistoricalEvaluationConfig,
+    evaluate_historical_dataframe,
+    evaluate_historical_stock,
+)
+```
+
+Example:
+
+```python
+config = HistoricalEvaluationConfig(
+    horizons_bars=(1, 3, 6),
+    target_return=0.01,
+    stop_return=0.005,
+)
+
+result = evaluate_historical_dataframe(
+    df=my_dataframe,
+    symbol="AAPL",
+    interval="15m",
+    as_of="2026-07-10T16:46:00-04:00",
+    evaluation_config=config,
+)
+```
+
+Historical evaluation reports:
+
+- forward returns by horizon
+- direction correctness
+- maximum favorable excursion
+- maximum adverse excursion
+- target-versus-stop first-touch outcomes
+- expectancy
+- win rate
+- false-positive rate
+- grouped summaries by pattern, market context, session time, and Signal Confidence bucket
+
+Important:
+
+```text
+Signal Confidence buckets are grouping labels for historical summaries.
+They are not historical probabilities and are not the same thing as measured performance.
+```
+
 ## Text And JSON Output
 
 Text output includes:
@@ -455,6 +538,8 @@ Text output includes:
 - Bullish score, bearish score, net signal score
 - Rule confidence
 - Pattern details with exact detection times
+- Current active evidence separated from historical session detections
+- Invalidation conditions for active and historical pattern records
 - Warnings and data-quality summary
 - Structured explanation
 
@@ -507,6 +592,9 @@ Offline fixture tests cover:
 - Instrument resolution
 - CLI behavior
 - Scoring and explanation consistency
+- Historical evaluation and backtesting metrics
+- Current-versus-historical reporting separation
+- Legacy compatibility wrappers and entry-point delegation
 
 ## Known Limitations
 
@@ -516,6 +604,7 @@ Offline fixture tests cover:
 - Data-quality validation catches many structural issues, but rule-based analysis still depends on input quality
 - Pattern recognition is deterministic and educational, not exhaustive
 - Rule confidence is not statistically calibrated
+- Historical evaluation is signal-level analysis, not a portfolio simulator
 
 ## Educational And Financial Disclaimer
 
@@ -529,5 +618,4 @@ Possible future improvements, not implemented in the current version:
 
 - Broader instrument metadata sources
 - Additional tested chart patterns
-- Packaged project metadata such as a publishable `pyproject.toml`
-- Historical simulation or backtesting in a separate, explicitly scoped module
+- Portfolio-level backtesting, execution simulation, and trade management

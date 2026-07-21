@@ -27,6 +27,7 @@ from stock_pattern_model.exceptions import UnknownSecurityNumberError
 from stock_pattern_model.formatters import format_analysis_json
 from stock_pattern_model.formatters import format_analysis_text
 from stock_pattern_model.resolver import CsvInstrumentResolver
+from stock_pattern_model.session_utils import SUPPORTED_SESSION_MODES
 
 
 LOGGER = logging.getLogger(__name__)
@@ -45,6 +46,7 @@ class ExitCode(IntEnum):
     NO_COMPLETED_BARS = 10
     MISSING_DATA_FILE = 11
     INTERNAL_FAILURE = 12
+    INTERRUPTED = 130
 
 
 def _parse_as_of(value: str | None) -> pd.Timestamp | None:
@@ -74,7 +76,19 @@ def build_parser() -> argparse.ArgumentParser:
     analyze_parser.add_argument("--lookback-bars", type=int, default=12)
     analyze_parser.add_argument("--top", type=int, default=3)
     analyze_parser.add_argument("--all-patterns", action="store_true")
+    analyze_parser.add_argument(
+        "--pattern-history",
+        choices=("none", "current", "session", "all"),
+        default="session",
+    )
+    analyze_parser.add_argument("--history-limit", type=int)
     analyze_parser.add_argument("--display-timezone", default="Asia/Jerusalem")
+    analyze_parser.add_argument(
+        "--session-mode",
+        choices=SUPPORTED_SESSION_MODES,
+        default="regular",
+        help="Session segment selection for analysis (default: regular).",
+    )
     analyze_parser.add_argument("--format", choices=("text", "json"), default="text")
     analyze_parser.add_argument("--output")
     analyze_parser.add_argument("--mapping-file")
@@ -138,6 +152,8 @@ def _run_analyze(
         instrument = resolver.resolve(identifier, mapping_file=args.mapping_file)
     _validate_positive_int(args.lookback_bars, "--lookback-bars")
     _validate_positive_int(args.top, "--top")
+    if args.history_limit is not None:
+        _validate_positive_int(args.history_limit, "--history-limit")
     if args.cache_ttl < 0:
         raise ConfigurationError("--cache-ttl must be >= 0.")
     if args.data_file and args.mapping_file and identifier.isdigit():
@@ -159,11 +175,17 @@ def _run_analyze(
         cache_ttl=args.cache_ttl,
         no_cache=args.no_cache,
         strict_data=args.strict_data,
+        session_mode=args.session_mode,
     )
 
     if args.format == "json":
         return format_analysis_json(result)
-    return format_analysis_text(result, include_all_patterns=args.all_patterns)
+    return format_analysis_text(
+        result,
+        include_all_patterns=args.all_patterns,
+        pattern_history_mode=args.pattern_history,
+        history_limit=args.history_limit,
+    )
 
 
 def main(
@@ -219,6 +241,9 @@ def main(
     except OutputFileError as error:
         print(str(error))
         return ExitCode.OUTPUT_FILE_FAILURE
+    except KeyboardInterrupt:
+        print("Analysis interrupted.")
+        return ExitCode.INTERRUPTED
     except Exception as error:  # noqa: BLE001
         if getattr(args, "verbose", False):
             LOGGER.exception("Unexpected internal failure")

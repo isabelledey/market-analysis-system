@@ -1,4 +1,7 @@
-"""Backward-compatible wrappers for the packaged analysis API."""
+"""Deprecated compatibility wrapper for the packaged analysis API.
+
+Import from ``stock_pattern_model.analysis`` instead.
+"""
 
 from __future__ import annotations
 

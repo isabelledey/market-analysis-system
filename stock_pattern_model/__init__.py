@@ -5,12 +5,23 @@ from __future__ import annotations
 from stock_pattern_model.analysis import analyze_dataframe
 from stock_pattern_model.analysis import analyze_stock
 from stock_pattern_model.config import MarketDataConfig
+from stock_pattern_model.config import HistoricalEvaluationConfig
 from stock_pattern_model.config import ScoringConfig
+from stock_pattern_model.context import AnalysisContext
+from stock_pattern_model.context import InstrumentMetadata
+from stock_pattern_model.context import TradingSession
 from stock_pattern_model.domain import DataQualityReport
+from stock_pattern_model.domain import HistoricalEvaluationResult
+from stock_pattern_model.domain import HistoricalPerformanceSummary
+from stock_pattern_model.domain import HistoricalSignalOutcome
+from stock_pattern_model.domain import HistoricalSignalRecord
 from stock_pattern_model.domain import MarketDataPayload
 from stock_pattern_model.domain import PatternEvent
 from stock_pattern_model.domain import PatternFamily
 from stock_pattern_model.domain import PatternStatus
+from stock_pattern_model.evaluation import collect_historical_signals_from_dataframe
+from stock_pattern_model.evaluation import evaluate_historical_dataframe
+from stock_pattern_model.evaluation import evaluate_historical_stock
 from stock_pattern_model.exceptions import CacheError
 from stock_pattern_model.exceptions import ConfigurationError
 from stock_pattern_model.exceptions import DataValidationError
@@ -39,7 +50,14 @@ __all__ = [
     "CacheError",
     "DataQualityReport",
     "DataValidationError",
+    "AnalysisContext",
+    "HistoricalEvaluationConfig",
+    "HistoricalEvaluationResult",
+    "HistoricalPerformanceSummary",
+    "HistoricalSignalOutcome",
+    "HistoricalSignalRecord",
     "FileDataProvider",
+    "InstrumentMetadata",
     "InstrumentResolver",
     "InvalidMappingFileError",
     "InvalidInstrumentError",
@@ -59,8 +77,12 @@ __all__ = [
     "ScoringConfig",
     "ScoringService",
     "StockPatternError",
+    "TradingSession",
     "UnknownSecurityNumberError",
     "YFinanceProvider",
     "analyze_dataframe",
     "analyze_stock",
+    "collect_historical_signals_from_dataframe",
+    "evaluate_historical_dataframe",
+    "evaluate_historical_stock",
 ]

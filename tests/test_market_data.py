@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import pytest
 
+from stock_pattern_model.analysis import analyze_dataframe
 from stock_pattern_model.analysis import analyze_stock
 from stock_pattern_model.features import add_features
 from stock_pattern_model.market_data import FileDataProvider
@@ -149,7 +150,7 @@ def test_missing_bar_warning() -> None:
     )
 
     assert report.irregular_gap_count == 1
-    assert any("irregular same-session gaps" in warning for warning in report.warnings)
+    assert any("irregular or mixed same-session interval" in warning for warning in report.warnings)
 
 
 def test_timezone_naive_input_requires_exchange_timezone(tmp_path: Path) -> None:
@@ -184,6 +185,162 @@ def test_daylight_saving_conversion(tmp_path: Path) -> None:
 
     assert payload.dataframe.loc[0, "Datetime"].isoformat().endswith("-05:00")
     assert payload.dataframe.loc[1, "Datetime"].isoformat().endswith("-04:00")
+
+
+def test_timezone_aware_input_is_converted_to_exchange_timezone() -> None:
+    utc_df = make_df(length=2).copy()
+    utc_df["Datetime"] = pd.to_datetime(utc_df["Datetime"]).dt.tz_convert("UTC")
+
+    validated_df, _ = validate_market_data(
+        utc_df,
+        interval="15m",
+        exchange_timezone="America/New_York",
+        strict_data=True,
+    )
+
+    assert str(pd.to_datetime(validated_df["Datetime"]).dt.tz) == "America/New_York"
+
+
+def test_extended_hours_can_be_excluded_when_requested() -> None:
+    df = pd.DataFrame(
+        [
+            {
+                "Datetime": pd.Timestamp("2026-07-10 08:00", tz=EXCHANGE_TZ),
+                "Open": 99.8,
+                "High": 100.0,
+                "Low": 99.6,
+                "Close": 99.9,
+                "Volume": 900,
+            },
+            {
+                "Datetime": pd.Timestamp("2026-07-10 09:30", tz=EXCHANGE_TZ),
+                "Open": 100.0,
+                "High": 100.5,
+                "Low": 99.7,
+                "Close": 100.2,
+                "Volume": 1200,
+            },
+            {
+                "Datetime": pd.Timestamp("2026-07-10 16:15", tz=EXCHANGE_TZ),
+                "Open": 100.1,
+                "High": 100.3,
+                "Low": 99.9,
+                "Close": 100.0,
+                "Volume": 950,
+            },
+        ]
+    )
+
+    validated_df, report = validate_market_data(
+        df,
+        interval="15m",
+        exchange_timezone="America/New_York",
+        strict_data=True,
+        include_extended_hours=False,
+    )
+
+    assert len(validated_df) == 1
+    assert "filtered_extended_hours" in report.cleaning_actions
+
+
+def test_extended_hours_can_be_retained_when_enabled() -> None:
+    df = pd.DataFrame(
+        [
+            {
+                "Datetime": pd.Timestamp("2026-07-10 08:00", tz=EXCHANGE_TZ),
+                "Open": 99.8,
+                "High": 100.0,
+                "Low": 99.6,
+                "Close": 99.9,
+                "Volume": 900,
+            },
+            {
+                "Datetime": pd.Timestamp("2026-07-10 09:30", tz=EXCHANGE_TZ),
+                "Open": 100.0,
+                "High": 100.5,
+                "Low": 99.7,
+                "Close": 100.2,
+                "Volume": 1200,
+            },
+        ]
+    )
+
+    validated_df, report = validate_market_data(
+        df,
+        interval="15m",
+        exchange_timezone="America/New_York",
+        strict_data=True,
+    )
+
+    assert len(validated_df) == 2
+    assert "filtered_extended_hours" not in report.cleaning_actions
+
+
+def test_cache_key_changes_when_session_context_changes(tmp_path: Path) -> None:
+    provider = YFinanceProvider(
+        config=MarketDataConfig(
+            cache_dir=str(tmp_path),
+            use_cache=True,
+        )
+    )
+
+    regular_key = provider._cache_file(
+        symbol="AAPL",
+        interval="15m",
+        period="1mo",
+        start=None,
+        end=None,
+        exchange_timezone="America/New_York",
+        strict_data=True,
+        session_mode="regular",
+        regular_session_start="09:30",
+        regular_session_end="16:00",
+    )
+    extended_key = provider._cache_file(
+        symbol="AAPL",
+        interval="15m",
+        period="1mo",
+        start=None,
+        end=None,
+        exchange_timezone="America/New_York",
+        strict_data=True,
+        session_mode="extended",
+        regular_session_start="09:30",
+        regular_session_end="16:00",
+    )
+    london_key = provider._cache_file(
+        symbol="AAPL",
+        interval="15m",
+        period="1mo",
+        start=None,
+        end=None,
+        exchange_timezone="Europe/London",
+        strict_data=True,
+        session_mode="regular",
+        regular_session_start="08:00",
+        regular_session_end="16:30",
+    )
+
+    assert regular_key is not None
+    assert extended_key is not None
+    assert london_key is not None
+    assert regular_key != extended_key
+    assert regular_key != london_key
+
+
+def test_weekend_gap_is_not_reported_as_same_session_gap() -> None:
+    friday = make_df(length=1, start="2026-07-10 15:45")
+    monday = make_df(length=1, start="2026-07-13 09:30")
+    combined = pd.concat([friday, monday], ignore_index=True)
+
+    _, report = validate_market_data(
+        combined,
+        interval="15m",
+        exchange_timezone="America/New_York",
+        strict_data=True,
+    )
+
+    assert report.irregular_gap_count == 0
 
 
 def test_cache_hit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -264,6 +421,18 @@ def test_offline_file_based_analysis() -> None:
     assert result["data_quality_report"]["row_count"] == 25
 
 
+def test_insufficient_history_warning_is_emitted() -> None:
+    df = make_df(length=3)
+
+    result = analyze_dataframe(
+        df,
+        symbol="SHORT",
+        as_of=pd.Timestamp("2026-07-10 10:16", tz=EXCHANGE_TZ),
+    )
+
+    assert any("completed bar(s) were available" in warning for warning in result["warnings"])
+
+
 def test_continuous_versus_session_reset_features() -> None:
     first_session = make_df(length=20, start="2026-07-10 09:30")
     second_session = make_df(length=5, start="2026-07-11 09:30")
@@ -285,3 +454,23 @@ def test_time_of_day_volume_fallback_behavior() -> None:
 
     assert feature_df.loc[0, "Volume_Baseline_Source"] == "rolling_20"
     assert feature_df.loc[len(feature_df) - 1, "Volume_Baseline_Source"] == "time_of_day"
+
+
+def test_past_only_feature_baselines_do_not_change_when_future_rows_change() -> None:
+    df = make_df(length=30)
+    prefix_features = add_features(df.iloc[:20].copy()).reset_index(drop=True)
+
+    modified = df.copy()
+    modified.loc[20:, ["High", "Low", "Close", "Volume"]] = [140.0, 80.0, 130.0, 9000]
+    full_features = add_features(modified).iloc[:20].reset_index(drop=True)
+
+    for column in [
+        "Avg_Range_20_Bars",
+        "Rolling_Volume_Baseline_20",
+        "Rolling_High_20_Bars",
+        "Rolling_Low_20_Bars",
+        "Volume_Baseline",
+        "Volume_Strength",
+        "Range_Strength",
+    ]:
+        pd.testing.assert_series_equal(prefix_features[column], full_features[column], check_names=False)

@@ -15,6 +15,8 @@ import pandas as pd
 import yfinance as yf
 
 from stock_pattern_model.config import MarketDataConfig
+from stock_pattern_model.context import AnalysisContext
+from stock_pattern_model.context import build_analysis_context
 from stock_pattern_model.domain import DataQualityReport
 from stock_pattern_model.domain import MarketDataPayload
 from stock_pattern_model.exceptions import CacheError
@@ -23,6 +25,12 @@ from stock_pattern_model.exceptions import InvalidInstrumentError
 from stock_pattern_model.exceptions import MarketDataError
 from stock_pattern_model.exceptions import MissingDataFileError
 from stock_pattern_model.exceptions import MarketDataProviderError
+from stock_pattern_model.session_utils import DEFAULT_REGULAR_SESSION_END
+from stock_pattern_model.session_utils import DEFAULT_REGULAR_SESSION_START
+from stock_pattern_model.session_utils import allowed_session_mask
+from stock_pattern_model.session_utils import normalize_session_mode
+from stock_pattern_model.session_utils import session_mode_requires_extended_hours
+from stock_pattern_model.session_utils import session_date_series
 
 
 LOGGER = logging.getLogger(__name__)
@@ -55,6 +63,9 @@ class MarketDataProvider(Protocol):
         as_of: pd.Timestamp | None = None,
         strict_data: bool = True,
         bypass_cache: bool = False,
+        include_extended_hours: bool = True,
+        session_mode: str | None = None,
+        context: AnalysisContext | None = None,
     ) -> MarketDataPayload:
         """Return validated market data plus metadata."""
 
@@ -102,18 +113,38 @@ def _localize_datetime_series(
             nonexistent="shift_forward",
         )
 
+    if exchange_timezone is not None:
+        return parsed.dt.tz_convert(ZoneInfo(exchange_timezone))
     return parsed
 
 
-def _count_irregular_gaps(datetimes: pd.Series, interval: str) -> int:
-    if len(datetimes) < 2:
+def _is_intraday_interval(interval: str) -> bool:
+    try:
+        return pd.to_timedelta(interval) < pd.Timedelta(days=1)
+    except ValueError:
+        return False
+
+
+def _count_irregular_gaps(
+    datetimes: pd.Series,
+    interval: str,
+    *,
+    session_dates: pd.Series,
+) -> int:
+    if len(datetimes) < 2 or not _is_intraday_interval(interval):
         return 0
 
     expected_gap = pd.to_timedelta(interval)
     gap_count = 0
     previous = datetimes.shift(1)
-    for current_time, previous_time in zip(datetimes.iloc[1:], previous.iloc[1:]):
-        if current_time.date() != previous_time.date():
+    previous_session_dates = session_dates.shift(1)
+    for current_time, previous_time, current_session_date, previous_session_date in zip(
+        datetimes.iloc[1:],
+        previous.iloc[1:],
+        session_dates.iloc[1:],
+        previous_session_dates.iloc[1:],
+    ):
+        if current_session_date != previous_session_date:
             continue
         if current_time - previous_time != expected_gap:
             gap_count += 1
@@ -127,8 +158,29 @@ def validate_market_data(
     exchange_timezone: str | None = None,
     as_of: pd.Timestamp | None = None,
     strict_data: bool = True,
+    include_extended_hours: bool = True,
+    session_mode: str | None = None,
+    regular_session_start: str = DEFAULT_REGULAR_SESSION_START,
+    regular_session_end: str = DEFAULT_REGULAR_SESSION_END,
+    context: AnalysisContext | None = None,
 ) -> tuple[pd.DataFrame, DataQualityReport]:
     """Validate and optionally clean a market-data DataFrame."""
+    effective_exchange_timezone = (
+        context.exchange_timezone
+        if context is not None and context.exchange_timezone is not None
+        else exchange_timezone
+    )
+    effective_session_mode = normalize_session_mode(
+        context.session_mode
+        if context is not None
+        else ("extended" if include_extended_hours and session_mode is None else session_mode)
+    )
+    effective_regular_session_start = (
+        context.regular_session_start if context is not None else regular_session_start
+    )
+    effective_regular_session_end = (
+        context.regular_session_end if context is not None else regular_session_end
+    )
     normalized_df = normalize_columns(df)
     missing_columns = [column for column in REQUIRED_COLUMNS if column not in normalized_df.columns]
     if missing_columns:
@@ -137,7 +189,7 @@ def validate_market_data(
     validated_df = normalized_df.loc[:, REQUIRED_COLUMNS].copy()
     validated_df["Datetime"] = _localize_datetime_series(
         validated_df["Datetime"],
-        exchange_timezone=exchange_timezone,
+        exchange_timezone=effective_exchange_timezone,
     )
     row_count = len(validated_df)
     warnings: list[str] = []
@@ -158,6 +210,24 @@ def validate_market_data(
             raise DataValidationError(f"Found {duplicate_count} duplicate timestamps.")
         validated_df = validated_df.drop_duplicates(subset=["Datetime"], keep="last").reset_index(drop=True)
         cleaning_actions.append("dropped_duplicate_timestamps")
+
+    if _is_intraday_interval(interval):
+        session_mask = allowed_session_mask(
+            validated_df["Datetime"],
+            session_mode=effective_session_mode,
+            exchange_timezone=effective_exchange_timezone,
+            regular_session_start=effective_regular_session_start,
+            regular_session_end=effective_regular_session_end,
+        )
+        excluded_rows = int((~session_mask).sum())
+        if excluded_rows:
+            warnings.append(
+                f"Excluded {excluded_rows} candle(s) outside session mode '{effective_session_mode}'."
+            )
+            validated_df = validated_df.loc[session_mask].reset_index(drop=True)
+            cleaning_actions.append("filtered_session_mode")
+            if effective_session_mode == "regular":
+                cleaning_actions.append("filtered_extended_hours")
 
     for column in ["Open", "High", "Low", "Close", "Volume"]:
         validated_df[column] = pd.to_numeric(validated_df[column], errors="coerce")
@@ -191,10 +261,15 @@ def validate_market_data(
         cleaning_actions.append("dropped_invalid_ohlcv_rows")
 
     validated_df = validated_df.sort_values("Datetime").reset_index(drop=True)
-    irregular_gap_count = _count_irregular_gaps(validated_df["Datetime"], interval)
+    session_dates = session_date_series(validated_df["Datetime"], effective_exchange_timezone)
+    irregular_gap_count = _count_irregular_gaps(
+        validated_df["Datetime"],
+        interval,
+        session_dates=session_dates,
+    )
     if irregular_gap_count:
         warnings.append(
-            f"Detected {irregular_gap_count} irregular same-session gaps relative to interval {interval}."
+            f"Detected {irregular_gap_count} irregular or mixed same-session interval(s) relative to interval {interval}."
         )
 
     completed_row_count = len(validated_df)
@@ -237,6 +312,9 @@ class FileDataProvider:
         as_of: pd.Timestamp | None = None,
         strict_data: bool = True,
         bypass_cache: bool = False,
+        include_extended_hours: bool = True,
+        session_mode: str | None = None,
+        context: AnalysisContext | None = None,
     ) -> MarketDataPayload:
         del period, bypass_cache
         if not self.file_path.exists():
@@ -265,6 +343,9 @@ class FileDataProvider:
             exchange_timezone=exchange_timezone,
             as_of=as_of,
             strict_data=strict_data,
+            include_extended_hours=include_extended_hours,
+            session_mode=session_mode,
+            context=context,
         )
 
         if start is not None:
@@ -308,13 +389,49 @@ class YFinanceProvider:
         as_of: pd.Timestamp | None = None,
         strict_data: bool = True,
         bypass_cache: bool = False,
+        include_extended_hours: bool = True,
+        session_mode: str | None = None,
+        context: AnalysisContext | None = None,
     ) -> MarketDataPayload:
         if not symbol or not isinstance(symbol, str):
             raise InvalidInstrumentError("symbol must be a non-empty string.")
         if period and start is not None and end is not None:
             raise MarketDataProviderError("Use either period or start/end, not all three together.")
 
-        cache_path = self._cache_file(symbol, interval, period, start, end)
+        effective_session_mode = normalize_session_mode(
+            context.session_mode
+            if context is not None
+            else ("extended" if include_extended_hours and session_mode is None else session_mode)
+        )
+        effective_exchange_timezone = (
+            context.exchange_timezone
+            if context is not None and context.exchange_timezone is not None
+            else exchange_timezone
+        )
+        effective_include_extended_hours = (
+            context.include_extended_hours
+            if context is not None
+            else session_mode_requires_extended_hours(effective_session_mode)
+        )
+        effective_regular_session_start = (
+            context.regular_session_start if context is not None else self.config.regular_session_start
+        )
+        effective_regular_session_end = (
+            context.regular_session_end if context is not None else self.config.regular_session_end
+        )
+
+        cache_path = self._cache_file(
+            symbol=symbol,
+            interval=interval,
+            period=period,
+            start=start,
+            end=end,
+            exchange_timezone=effective_exchange_timezone,
+            strict_data=strict_data,
+            session_mode=effective_session_mode,
+            regular_session_start=effective_regular_session_start,
+            regular_session_end=effective_regular_session_end,
+        )
         if self.config.use_cache and not bypass_cache and cache_path and self._is_cache_fresh(cache_path):
             cached_payload = self._load_cache(cache_path)
             if cached_payload is not None:
@@ -324,14 +441,50 @@ class YFinanceProvider:
         last_error: Exception | None = None
         for attempt in range(1, self.config.retry_attempts + 1):
             try:
-                raw_df, metadata = self._download(symbol, interval, period, start, end)
+                raw_df, metadata = self._download(
+                    symbol,
+                    interval,
+                    period,
+                    start,
+                    end,
+                    include_extended_hours=effective_include_extended_hours,
+                )
+                refined_context = build_analysis_context(
+                    symbol=symbol,
+                    interval=interval,
+                    display_timezone=context.display_timezone if context is not None else "Asia/Jerusalem",
+                    session_mode=effective_session_mode,
+                    instrument=None if context is None else None,
+                    provider="yfinance",
+                    provider_metadata=metadata,
+                    requested_period=period,
+                    requested_start=start,
+                    requested_end=end,
+                    exchange_timezone_override=effective_exchange_timezone,
+                    regular_session_start=effective_regular_session_start,
+                    regular_session_end=effective_regular_session_end,
+                    cache_config={
+                        "cache_dir": self.config.cache_dir,
+                        "cache_ttl_seconds": self.config.cache_ttl_seconds,
+                        "use_cache": self.config.use_cache,
+                    },
+                )
                 validated_df, report = validate_market_data(
                     raw_df,
                     interval=interval,
-                    exchange_timezone=exchange_timezone,
+                    exchange_timezone=refined_context.exchange_timezone,
                     as_of=as_of,
                     strict_data=strict_data,
+                    include_extended_hours=refined_context.include_extended_hours,
+                    session_mode=refined_context.session_mode,
+                    regular_session_start=refined_context.regular_session_start,
+                    regular_session_end=refined_context.regular_session_end,
+                    context=refined_context,
                 )
+                metadata["instrument_metadata"] = refined_context.instrument.to_dict()
+                metadata["session_mode"] = refined_context.session_mode
+                metadata["include_extended_hours"] = refined_context.include_extended_hours
+                metadata["exchange_timezone"] = refined_context.exchange_timezone
                 payload = MarketDataPayload(
                     dataframe=validated_df,
                     quality_report=report,
@@ -367,13 +520,15 @@ class YFinanceProvider:
         period: str | None,
         start: str | pd.Timestamp | None,
         end: str | pd.Timestamp | None,
+        *,
+        include_extended_hours: bool,
     ) -> tuple[pd.DataFrame, dict[str, Any]]:
         try:
             ticker = yf.Ticker(symbol)
             history_kwargs: dict[str, Any] = {
                 "interval": interval,
                 "auto_adjust": False,
-                "prepost": False,
+                "prepost": include_extended_hours,
                 "actions": False,
                 "timeout": self.config.timeout_seconds,
             }
@@ -396,6 +551,12 @@ class YFinanceProvider:
                     metadata["fast_info"] = dict(fast_info)
             except Exception:  # noqa: BLE001
                 metadata["fast_info"] = None
+            try:
+                history_metadata = getattr(ticker, "history_metadata", None)
+                if history_metadata:
+                    metadata["history_metadata"] = dict(history_metadata)
+            except Exception:  # noqa: BLE001
+                metadata["history_metadata"] = None
             return data, metadata
         except Exception as error:  # noqa: BLE001
             raise MarketDataProviderError(
@@ -404,11 +565,17 @@ class YFinanceProvider:
 
     def _cache_file(
         self,
+        *,
         symbol: str,
         interval: str,
         period: str | None,
         start: str | pd.Timestamp | None,
         end: str | pd.Timestamp | None,
+        exchange_timezone: str | None,
+        strict_data: bool,
+        session_mode: str,
+        regular_session_start: str,
+        regular_session_end: str,
     ) -> Path | None:
         cache_root = self.config.cache_path()
         if cache_root is None:
@@ -421,6 +588,11 @@ class YFinanceProvider:
                 "period": str(period),
                 "start": str(start),
                 "end": str(end),
+                "exchange_timezone": exchange_timezone,
+                "strict_data": strict_data,
+                "session_mode": session_mode,
+                "regular_session_start": regular_session_start,
+                "regular_session_end": regular_session_end,
             },
             sort_keys=True,
         ).encode("utf-8")

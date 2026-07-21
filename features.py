@@ -1,4 +1,7 @@
-"""Backward-compatible exports for the packaged feature layer."""
+"""Deprecated compatibility wrapper for the packaged feature layer.
+
+Import from ``stock_pattern_model.features`` instead.
+"""
 
 from __future__ import annotations
 

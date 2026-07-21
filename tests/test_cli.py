@@ -243,11 +243,38 @@ def test_output_file_creation(tmp_path: Path) -> None:
     assert '"symbol": "AAPL"' in output_file.read_text(encoding="utf-8")
 
 
+def test_cli_forwards_session_mode_to_analyzer() -> None:
+    captured_kwargs: dict[str, object] = {}
+
+    def capturing_analyzer(symbol: str, **kwargs) -> dict:
+        captured_kwargs.update(kwargs)
+        return offline_analyzer(symbol, **kwargs)
+
+    exit_code = main(
+        ["analyze", "AAPL", "--session-mode", "regular-and-afterhours", "--format", "json"],
+        analyzer=capturing_analyzer,
+    )
+
+    assert exit_code == ExitCode.SUCCESS
+    assert captured_kwargs["session_mode"] == "regular-and-afterhours"
+
+
 def test_invalid_interval_rejection() -> None:
     with pytest.raises(SystemExit) as error:
         main(["analyze", "AAPL", "--interval", "2hours"], analyzer=offline_analyzer)
 
     assert error.value.code == 2
+
+
+def test_keyboard_interrupt_exits_cleanly(capsys: pytest.CaptureFixture[str]) -> None:
+    def interrupted_analyzer(symbol: str, **kwargs) -> dict:
+        raise KeyboardInterrupt
+
+    exit_code = main(["analyze", "AAPL"], analyzer=interrupted_analyzer)
+    captured = capsys.readouterr()
+
+    assert exit_code == ExitCode.INTERRUPTED
+    assert captured.out.strip() == "Analysis interrupted."
 
 
 def test_invalid_timezone_rejection(capsys: pytest.CaptureFixture[str]) -> None:
@@ -418,3 +445,17 @@ def test_root_main_data_file_flag_delegation(monkeypatch: pytest.MonkeyPatch) ->
 
     assert exit_code == 0
     assert calls == [["analyze", "TEST", "--data-file", "fixture.csv", "--exchange-timezone", "America/New_York"]]
+
+
+def test_legacy_root_modules_remain_importable_but_clearly_deprecated() -> None:
+    legacy_data_loader = importlib.import_module("data_loader")
+    legacy_features = importlib.import_module("features")
+    legacy_pattern_detector = importlib.import_module("pattern_detector")
+    legacy_model = importlib.import_module("model")
+
+    assert "deprecated compatibility wrapper" in (legacy_data_loader.__doc__ or "").lower()
+    assert "deprecated compatibility wrapper" in (legacy_features.__doc__ or "").lower()
+    assert "deprecated compatibility wrapper" in (legacy_pattern_detector.__doc__ or "").lower()
+    assert "deprecated compatibility wrapper" in (legacy_model.__doc__ or "").lower()
+    assert callable(legacy_features.add_features)
+    assert callable(legacy_model.analyze_stock)

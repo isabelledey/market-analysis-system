@@ -1,4 +1,7 @@
-"""Backward-compatible exports for the packaged pattern detector registry."""
+"""Deprecated compatibility wrapper for the packaged pattern detector registry.
+
+Import from ``stock_pattern_model.pattern_detector`` instead.
+"""
 
 from __future__ import annotations
 

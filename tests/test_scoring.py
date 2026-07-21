@@ -75,8 +75,10 @@ def make_pattern_record(
     volume_confirmed: bool = True,
     strong_signal: bool = False,
     score_eligible: bool = True,
+    event_state: str | None = None,
+    extra_fields: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    return {
+    record = {
         "event": event,
         "pattern_id": event.pattern_id,
         "pattern_name": event.pattern_name,
@@ -96,6 +98,11 @@ def make_pattern_record(
         "volume_baseline_source": event.volume_baseline_source,
         "score_eligible": score_eligible,
     }
+    if event_state is not None:
+        record["event_state"] = event_state
+    if extra_fields:
+        record.update(extra_fields)
+    return record
 
 
 def make_base_df(length: int = 30, start: str = "2026-07-10 09:30") -> pd.DataFrame:
@@ -129,6 +136,9 @@ def test_no_pattern_analysis_outputs_neutral_scores() -> None:
         "trend_evidence",
         "bullish_evidence",
         "bearish_evidence",
+        "current_pattern_evidence",
+        "session_context",
+        "lifecycle_note",
         "conflicts",
         "data_warnings",
         "reason_for_bias",
@@ -241,7 +251,13 @@ def test_conflicting_evidence_reduces_confidence_and_bias() -> None:
 
 
 def test_old_events_expire_and_do_not_drive_state() -> None:
-    service = ScoringService(ScoringConfig(state_expiration_bars=3, pattern_max_age_bars=12))
+    service = ScoringService(
+        ScoringConfig(
+            state_expiration_bars=3,
+            pattern_max_age_bars=12,
+            breakout_pattern_max_age_bars=3,
+        )
+    )
     patterns = [
         make_pattern_record(
             event=make_event(
@@ -269,6 +285,44 @@ def test_old_events_expire_and_do_not_drive_state() -> None:
 
     assert result["patterns"][0]["event_state"] == "expired"
     assert result["market_state"] == "Trend Only"
+
+
+def test_breakout_uses_family_specific_horizon_instead_of_global_four_bar_expiry() -> None:
+    service = ScoringService(
+        ScoringConfig(
+            state_expiration_bars=4,
+            pattern_max_age_bars=4,
+            breakout_pattern_max_age_bars=12,
+        )
+    )
+    patterns = [
+        make_pattern_record(
+            event=make_event(
+                pattern_id="breakout",
+                pattern_name="20-Bar Breakout",
+                pattern_family=PatternFamily.BREAKOUT,
+                bias="Bullish",
+                base_score=18,
+            ),
+            candles_ago=6,
+        ),
+    ]
+
+    result = service.evaluate(
+        symbol="LONG",
+        trend="Uptrend",
+        patterns=patterns,
+        quality_report=make_quality_report(),
+        latest_close=101.5,
+        latest_bar_start_display="2026-07-10 22:30 Asia/Jerusalem",
+        latest_bar_end_display="2026-07-10 22:45 Asia/Jerusalem",
+        interval="15m",
+        latest_volume_baseline_source="time_of_day",
+    )
+
+    assert result["patterns"][0]["event_state"] == "active"
+    assert result["patterns"][0]["score_eligible"] is True
+    assert result["score"]["bullish_score"] > 0
 
 
 def test_duplicate_evidence_is_not_counted_twice() -> None:
@@ -316,7 +370,10 @@ def test_duplicate_evidence_is_not_counted_twice() -> None:
     )
 
     primary_patterns = [pattern for pattern in result["patterns"] if pattern["group_primary"]]
-    suppressed_patterns = [pattern for pattern in result["patterns"] if pattern["group_suppressed"]]
+    suppressed_patterns = [
+        pattern for pattern in result["patterns"]
+        if pattern["group_suppressed"] or pattern.get("dependency_suppressed")
+    ]
     assert len(primary_patterns) == 1
     assert len(suppressed_patterns) == 1
     assert result["score"]["bearish_score"] < 50
@@ -394,6 +451,84 @@ def test_tentative_patterns_do_not_affect_default_signals() -> None:
     assert result["overall_bias"] == "Neutral"
 
 
+def test_invalidated_pattern_contributes_zero_everywhere() -> None:
+    service = ScoringService(ScoringConfig())
+    patterns = [
+        make_pattern_record(
+            event=make_event(
+                pattern_id="breakout",
+                pattern_name="20-Bar Breakout",
+                pattern_family=PatternFamily.BREAKOUT,
+                bias="Bullish",
+                base_score=18,
+            ),
+            candles_ago=1,
+            event_state="invalidated",
+            extra_fields={"invalidation_index": 9},
+        ),
+    ]
+
+    result = service.evaluate(
+        symbol="INV",
+        trend="Uptrend",
+        patterns=patterns,
+        quality_report=make_quality_report(),
+        latest_close=101.1,
+        latest_bar_start_display="2026-07-10 22:30 Asia/Jerusalem",
+        latest_bar_end_display="2026-07-10 22:45 Asia/Jerusalem",
+        interval="15m",
+        latest_volume_baseline_source="time_of_day",
+    )
+
+    pattern = result["patterns"][0]
+    assert pattern["score_eligible"] is False
+    assert pattern["score_ineligibility_reason"] == "invalidated"
+    assert result["score"]["bullish_score"] == 0
+    assert result["score"]["pattern_score"] == 0
+    assert result["overall_bias"] == "Neutral"
+    assert result["rule_confidence"] <= 12.0
+
+
+def test_reclaimed_breakdown_is_not_score_eligible() -> None:
+    service = ScoringService(ScoringConfig())
+    patterns = [
+        make_pattern_record(
+            event=make_event(
+                pattern_id="breakdown",
+                pattern_name="20-Bar Breakdown",
+                pattern_family=PatternFamily.BREAKOUT,
+                bias="Bearish",
+                base_score=18,
+            ),
+            candles_ago=4,
+            event_state="reclaimed",
+            extra_fields={
+                "reclaimed_index": 12,
+                "detected_index": 8,
+                "last_completed_candle_index": 12,
+            },
+        ),
+    ]
+
+    result = service.evaluate(
+        symbol="RECLAIM",
+        trend="Downtrend",
+        patterns=patterns,
+        quality_report=make_quality_report(),
+        latest_close=100.4,
+        latest_bar_start_display="2026-07-10 22:30 Asia/Jerusalem",
+        latest_bar_end_display="2026-07-10 22:45 Asia/Jerusalem",
+        interval="15m",
+        latest_volume_baseline_source="time_of_day",
+    )
+
+    pattern = result["patterns"][0]
+    assert pattern["score_eligible"] is False
+    assert pattern["score_ineligibility_reason"] == "level reclaimed"
+    assert result["score"]["bearish_score"] == 0
+    assert result["market_state"] == "Trend Only"
+
+
 def test_scores_bias_and_explanation_remain_consistent() -> None:
     service = ScoringService(ScoringConfig())
     patterns = [
@@ -425,6 +560,37 @@ def test_scores_bias_and_explanation_remain_consistent() -> None:
     assert result["overall_bias"] == "Bearish"
     assert "Bearish" in result["structured_explanation"]["reason_for_bias"] or "Bearish" in result["structured_explanation"]["summary"]
     assert "not statistically calibrated" not in result["structured_explanation"]["reason_for_confidence"]
+
+
+def test_recent_retest_transition_becomes_score_anchor_for_breakdown() -> None:
+    df = make_base_df(length=30)
+    for index in range(25):
+        df.loc[index, ["Open", "High", "Low", "Close", "Volume"]] = [100.10, 100.30, 99.80, 100.05, 1200]
+    df.loc[25, ["Open", "High", "Low", "Close", "Volume"]] = [100.10, 100.20, 99.00, 99.10, 2600]
+    df.loc[26, ["Open", "High", "Low", "Close", "Volume"]] = [99.20, 99.30, 98.80, 98.90, 1400]
+    df.loc[27, ["Open", "High", "Low", "Close", "Volume"]] = [98.95, 99.78, 98.70, 99.20, 1500]
+    df.loc[28, ["Open", "High", "Low", "Close", "Volume"]] = [99.10, 99.25, 98.60, 98.75, 1300]
+    df.loc[29, ["Open", "High", "Low", "Close", "Volume"]] = [98.80, 99.10, 98.35, 98.60, 1250]
+
+    result = analyze_dataframe(df=df, symbol="ANCHOR", as_of=pd.Timestamp("2026-07-10 17:01", tz=EXCHANGE_TZ))
+    breakdown = next(
+        pattern for pattern in result["all_detected_patterns"]
+        if "Breakdown" in pattern["pattern_name"]
+    )
+
+    assert breakdown["event_state"] == "retest_rejected"
+    assert breakdown["score_anchor_type"] == "rejection"
+    assert breakdown["score_anchor_candles_ago"] < breakdown["candles_ago"]
+
+
+def test_internal_score_reconciliation_produces_no_validation_warning_for_consistent_case() -> None:
+    df = make_base_df(length=30)
+    df.loc[20, ["Open", "High", "Low", "Close", "Volume"]] = [100.10, 100.20, 99.00, 99.10, 2600]
+    df.loc[21, ["Open", "High", "Low", "Close", "Volume"]] = [99.20, 99.30, 98.80, 98.90, 1400]
+
+    result = analyze_dataframe(df=df, symbol="VALID", as_of=pd.Timestamp("2026-07-10 17:01", tz=EXCHANGE_TZ))
+
+    assert all("Internal validation:" not in warning for warning in result["warnings"])
 
 
 def test_analysis_result_is_json_serializable() -> None:

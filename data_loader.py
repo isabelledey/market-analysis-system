@@ -1,4 +1,7 @@
-"""Backward-compatible exports for the packaged market-data layer."""
+"""Deprecated compatibility wrapper for the packaged market-data layer.
+
+Import from ``stock_pattern_model.data_loader`` instead.
+"""
 
 from __future__ import annotations
 

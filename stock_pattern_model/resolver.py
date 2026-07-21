@@ -69,7 +69,7 @@ class CsvInstrumentResolver:
             name=normalized,
             exchange="Unknown",
             currency="Unknown",
-            exchange_timezone="America/New_York",
+            exchange_timezone=None,
         )
 
     def _resolve_security_number(
