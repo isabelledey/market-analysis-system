@@ -170,7 +170,8 @@ def test_latest_completed_pinbar_stays_new_with_no_retest() -> None:
         pattern for pattern in result["all_detected_patterns"]
         if pattern["pattern_completion_index"] == len(df) - 1
     ]
-    assert {pattern["pattern_name"] for pattern in latest_labels} >= {"Bullish Pin Bar", "Doji"}
+    assert {pattern["detector_label"] for pattern in latest_labels} >= {"Bullish Pin Bar", "Doji"}
+    assert canonical["matched_detector_labels"] == ["Bullish Pin Bar", "Doji"]
     assert all(pattern["event_state"] == "new" for pattern in latest_labels)
 
 
@@ -196,7 +197,7 @@ def test_later_completed_pinbar_retest_changes_state() -> None:
 
     canonical = next(
         pattern for pattern in result["current_relevant_patterns"]
-        if pattern["primary_pattern_name"] == "Bullish Pin Bar"
+        if "Bullish Pin Bar" in pattern["matched_detector_labels"]
     )
     assert canonical["state"] == "retested"
     assert canonical["retest_at"] is not None
@@ -278,6 +279,7 @@ def test_overlapping_pinbar_and_doji_form_one_canonical_event() -> None:
 
     assert len(result["current_relevant_patterns"]) == 1
     canonical = result["current_relevant_patterns"][0]
+    assert canonical["primary_pattern_name"] == "Lower-Wick Rejection"
     assert canonical["pattern_labels"] == ["Bullish Pin Bar", "Doji"]
     assert canonical["label_count"] == 2
     assert canonical["overlap_label_count"] == 1
@@ -292,7 +294,7 @@ def test_bullish_pinbar_hammer_and_doji_share_one_canonical_candle_event() -> No
     result = analyze_dataframe(df, symbol="HAMMER", as_of=analysis_as_of(df), top_pattern_count=10)
 
     canonical = result["current_relevant_patterns"][0]
-    assert canonical["primary_pattern_name"] == "Bullish Pin Bar"
+    assert canonical["primary_pattern_name"] == "Hammer"
     assert canonical["pattern_labels"] == ["Bullish Pin Bar", "Doji", "Hammer"]
     assert canonical["included_in_current_score"] is True
 
@@ -348,6 +350,34 @@ def test_current_relevant_patterns_are_sorted_by_latest_transition_time() -> Non
 
     leading_labels = ", ".join(result["current_relevant_patterns"][0]["pattern_labels"])
     assert leading_labels in result["structured_explanation"]["lifecycle_note"]
+
+
+def test_neutral_and_awaiting_confirmation_events_are_separated_from_current_contributors() -> None:
+    doji_df = make_session("2026-07-20")
+    set_doji(doji_df, len(doji_df) - 1)
+    doji_result = analyze_dataframe(doji_df, symbol="NEUTRAL", as_of=analysis_as_of(doji_df), top_pattern_count=10)
+
+    assert len(doji_result["current_neutral_evidence"]) >= 1
+    assert doji_result["current_neutral_evidence"][0]["primary_pattern_name"] == "Doji"
+    assert all(
+        event["primary_pattern_name"] != "Doji"
+        for event in doji_result["current_contributing_evidence"]
+    )
+
+    tentative_df = make_double_bottom_session(confirmed=False)
+    tentative_result = analyze_dataframe(
+        tentative_df,
+        symbol="AWAIT",
+        as_of=analysis_as_of(tentative_df),
+        top_pattern_count=10,
+    )
+
+    assert len(tentative_result["awaiting_confirmation_evidence"]) >= 1
+    assert tentative_result["awaiting_confirmation_evidence"][0]["state"] == "awaiting_confirmation"
+    assert all(
+        event["primary_pattern_name"] != "Double Bottom"
+        for event in tentative_result["current_contributing_evidence"]
+    )
 
 
 def test_previous_session_warmup_data_is_not_listed_in_current_session_history() -> None:
@@ -428,7 +458,8 @@ def test_session_history_is_rendered_in_display_timezone() -> None:
     result = analyze_dataframe(df, symbol="TEXT", as_of=analysis_as_of(df), top_pattern_count=10)
     report = format_analysis_text(result)
 
-    assert "Current Active Evidence (" in report
+    assert "Current Contributing Evidence (" in report
+    assert "Current Neutral / Informational Evidence (" in report
     assert "Historical Session Detections (" in report
     assert "Asia/Jerusalem" in report
     assert "grouped into 1 candlestick event" in report
@@ -558,3 +589,26 @@ def test_structural_pattern_and_breakdown_stay_separate_but_related() -> None:
     assert breakdown["relationship_type"] == "confirms"
     assert double_top["overlap_note"] is None
     assert breakdown["overlap_note"] is None
+
+
+def test_primary_evidence_collections_are_pairwise_disjoint() -> None:
+    df = make_session("2026-07-20", start_price=101.5, step=-0.18)
+    df.loc[10, ["Open", "High", "Low", "Close", "Volume"]] = [99.8, 101.2, 99.7, 101.0, 2600]
+    df.loc[11, ["Open", "High", "Low", "Close", "Volume"]] = [101.1, 101.3, 99.4, 99.6, 2800]
+    df.loc[len(df) - 1, ["Open", "High", "Low", "Close", "Volume"]] = [96.00, 96.05, 94.50, 96.02, 4200]
+
+    result = analyze_dataframe(df, symbol="PART", as_of=analysis_as_of(df), top_pattern_count=10)
+
+    collections = [
+        result["current_contributing_evidence"],
+        result["awaiting_confirmation_evidence"],
+        result["current_conflicting_evidence"],
+        result["current_neutral_evidence"],
+        result["recent_non_contributing_tracked_events"],
+        result["historical_lifecycle_events"],
+    ]
+    seen_ids: set[str] = set()
+    for collection in collections:
+        ids = {event["event_id"] for event in collection}
+        assert seen_ids.isdisjoint(ids)
+        seen_ids |= ids

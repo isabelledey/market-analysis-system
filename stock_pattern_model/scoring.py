@@ -46,6 +46,23 @@ ACTIVE_SIGNAL_STATES = {
     "retest_rejected",
 }
 
+PATTERN_SEMANTIC_SPECIFICITY = {
+    "hammer": 40,
+    "shooting_star": 35,
+    "morning_star": 32,
+    "evening_star": 32,
+    "bullish_engulfing": 28,
+    "bearish_engulfing": 28,
+    "breakout": 26,
+    "breakdown": 26,
+    "double_top": 24,
+    "double_bottom": 24,
+    "bullish_pin_bar": 18,
+    "inside_bar_failure": 16,
+    "inside_bar": 12,
+    "doji": 8,
+}
+
 
 def _event_index(pattern: dict[str, Any], field_name: str) -> int | None:
     value = pattern.get(field_name)
@@ -197,6 +214,41 @@ def build_evidence_group(pattern: dict[str, Any]) -> str:
     )
 
 
+def analytical_family(pattern: dict[str, Any]) -> str:
+    pattern_id = str(pattern.get("pattern_id") or "")
+    family = str(pattern.get("pattern_family") or "")
+    if pattern_id in {"breakout", "breakdown", "double_top", "double_bottom"}:
+        return "structure"
+    if family in {"pin_bar", "engulfing", "star", "doji"}:
+        return "candlestick_reversal"
+    if family in {"inside_bar", "inside_bar_failure"}:
+        return "consolidation"
+    return family or "other"
+
+
+def resolved_pattern_sort_key(pattern: dict[str, Any]) -> tuple[object, ...]:
+    pattern_name = str(pattern.get("pattern_name") or "")
+    context_quality = str(
+        pattern.get("context_quality")
+        or getattr(pattern.get("event"), "context_quality", "unknown")
+    )
+    status = str(pattern.get("status") or "")
+    bias = str(pattern.get("bias") or "")
+    pattern_id = str(pattern.get("pattern_id") or "")
+    generic_geometry_name = pattern_name.endswith("Rejection")
+    return (
+        0 if context_quality == "validated" else 1 if context_quality == "supported" else 2,
+        0 if status == "confirmed" else 1 if status == "tentative" else 2 if status == "candidate" else 3,
+        0 if bias in {"Bullish", "Bearish"} else 1,
+        -PATTERN_SEMANTIC_SPECIFICITY.get(pattern_id, 0),
+        0 if not generic_geometry_name else 1,
+        int(pattern.get("priority", 99)),
+        int(pattern.get("score_anchor_candles_ago", pattern.get("candles_ago", 0))),
+        -abs(float(pattern.get("base_score", 0.0))),
+        pattern_name,
+    )
+
+
 @dataclass(frozen=True)
 class ScoringService:
     """Calculate signal scores, market state, and structured explanations."""
@@ -210,6 +262,7 @@ class ScoringService:
         trend: str,
         trend_structure_score: float | None = None,
         trend_evidence: list[str] | None = None,
+        trend_evidence_structured: list[dict[str, Any]] | None = None,
         trend_horizon: str | None = None,
         display_timezone: str = "Asia/Jerusalem",
         patterns: list[dict[str, Any]],
@@ -247,6 +300,7 @@ class ScoringService:
             trend=trend,
             trend_structure_score=trend_structure_score,
             trend_evidence=trend_evidence or [],
+            trend_evidence_structured=trend_evidence_structured or [],
             trend_horizon=trend_horizon,
             market_state=market_state,
             overall_bias=overall_bias,
@@ -308,6 +362,7 @@ class ScoringService:
             pattern["score_ineligibility_reason"] = decision.reason
             pattern["volume_score_contribution"] = 0.0
             pattern["pattern_score_contribution"] = 0.0
+            pattern["combined_score_contribution"] = 0.0
             pattern["group_primary"] = False
             pattern["group_suppressed"] = False
             pattern["dependency_suppressed"] = False
@@ -368,17 +423,16 @@ class ScoringService:
         for group_patterns in groups.values():
             ranked_group = sorted(
                 group_patterns,
-                key=lambda item: (
-                    item["status"] != "confirmed",
-                    -abs(self._raw_pattern_score(item)),
-                    item.get("score_anchor_candles_ago", item["candles_ago"]),
-                    item["priority"],
-                ),
+                key=resolved_pattern_sort_key,
             )
             primary = ranked_group[0]
             primary["group_primary"] = True
             primary["pattern_score_contribution"] = round(self._raw_pattern_score(primary), 2)
             primary["volume_score_contribution"] = round(self._volume_contribution(primary), 2)
+            primary["combined_score_contribution"] = round(
+                primary["pattern_score_contribution"] + primary["volume_score_contribution"],
+                2,
+            )
             primary_patterns.append(primary)
 
             for pattern in ranked_group[1:]:
@@ -499,6 +553,8 @@ class ScoringService:
             "trend_score": trend_score,
             "pattern_score": pattern_score,
             "volume_score": volume_score,
+            "bullish_pattern_score": bullish_score,
+            "bearish_pattern_score": bearish_score,
             "bullish_score": bullish_score,
             "bearish_score": bearish_score,
             "net_signal_score": net_signal_score,
@@ -618,9 +674,9 @@ class ScoringService:
             sum(1 for pattern in confirmed_patterns if pattern["volume_confirmed"])
             / len(confirmed_patterns)
         )
-        independent_groups = len({pattern["evidence_group"] for pattern in confirmed_patterns})
-        independent_families = len({pattern["pattern_family"] for pattern in confirmed_patterns})
-        agreement_bonus = independent_groups * 7.0
+        canonical_groups = len({pattern["evidence_group"] for pattern in confirmed_patterns})
+        independent_families = len({analytical_family(pattern) for pattern in confirmed_patterns})
+        agreement_bonus = min(canonical_groups, independent_families + 1) * 7.0
         confirmation_bonus = min(len(confirmed_patterns), 4) * 6.0
         recency_bonus = mean(recency_values) * 18.0
         strength_bonus = mean(strength_values) * 14.0
@@ -639,6 +695,7 @@ class ScoringService:
         )
         duplicate_penalty = len(suppressed_patterns) * self.config.duplicate_group_confidence_penalty
         family_penalty = max(0, len(confirmed_patterns) - independent_families) * 3.0
+        concentration_penalty = max(0, canonical_groups - independent_families) * 4.0
         age_penalty = max(0.0, 10.0 * (1.0 - mean(recency_values)))
         trend_only_penalty = 12.0 if market_state == "Trend Only" else 0.0
 
@@ -654,6 +711,7 @@ class ScoringService:
             - data_penalty
             - duplicate_penalty
             - family_penalty
+            - concentration_penalty
             - age_penalty
             - trend_only_penalty
         )
@@ -666,6 +724,7 @@ class ScoringService:
         trend: str,
         trend_structure_score: float | None,
         trend_evidence: list[str],
+        trend_evidence_structured: list[dict[str, Any]],
         trend_horizon: str | None,
         market_state: str,
         overall_bias: str,
@@ -688,6 +747,21 @@ class ScoringService:
         bearish_patterns = [
             pattern for pattern in primary_patterns
             if pattern["bias"] == "Bearish"
+        ]
+        supporting_trend_evidence = [
+            item["explanation"]
+            for item in trend_evidence_structured
+            if item.get("supports_composite_trend")
+        ]
+        conflicting_trend_evidence = [
+            item["explanation"]
+            for item in trend_evidence_structured
+            if item.get("conflicts_with_composite_trend")
+        ]
+        neutral_trend_evidence = [
+            item["explanation"]
+            for item in trend_evidence_structured
+            if not item.get("supports_composite_trend") and not item.get("conflicts_with_composite_trend")
         ]
         conflicts: list[str] = []
         if bullish_patterns and bearish_patterns:
@@ -727,8 +801,10 @@ class ScoringService:
 
         confidence_reasons: list[str] = []
         if primary_patterns:
+            canonical_groups = len({pattern["evidence_group"] for pattern in primary_patterns})
+            independent_families = len({analytical_family(pattern) for pattern in primary_patterns})
             confidence_reasons.append(
-                f"{len(primary_patterns)} independent evidence group(s) were scored after deduplication."
+                f"{canonical_groups} canonical scored group(s) resolved into {independent_families} independent analytical family/families."
             )
         if quality_report.warnings:
             confidence_reasons.append("Data-quality warnings reduced confidence.")
@@ -753,9 +829,29 @@ class ScoringService:
             f"Market state: {market_state}. Overall bias: {overall_bias}. "
             f"Net signal score: {score['net_signal_score']:.2f}. Rule confidence: {rule_confidence:.1f}/100."
         )
+        confidence_breakdown = {
+            "confirmed_score_eligible_groups": len(primary_patterns),
+            "independent_analytical_families": len({analytical_family(pattern) for pattern in primary_patterns}),
+            "conflict_present": bool(bullish_patterns and bearish_patterns),
+            "volume_confirmed_ratio": round(
+                (
+                    sum(1 for pattern in primary_patterns if pattern["volume_confirmed"])
+                    / len(primary_patterns)
+                )
+                if primary_patterns
+                else 0.0,
+                2,
+            ),
+            "quality_warning_count": len(quality_report.warnings),
+            "uncalibrated": True,
+        }
         return {
             "summary": summary,
             "trend_evidence": trend_evidence,
+            "trend_evidence_structured": trend_evidence_structured,
+            "supporting_trend_evidence": supporting_trend_evidence,
+            "conflicting_trend_evidence": conflicting_trend_evidence,
+            "neutral_trend_evidence": neutral_trend_evidence,
             "bullish_evidence": [
                 self._format_evidence_line(pattern, display_timezone=display_timezone)
                 for pattern in bullish_patterns[:3]
@@ -768,6 +864,7 @@ class ScoringService:
             "data_warnings": list(quality_report.warnings),
             "reason_for_bias": reason_for_bias,
             "reason_for_confidence": " ".join(confidence_reasons),
+            "confidence_breakdown": confidence_breakdown,
         }
 
     def _build_text_explanation(self, structured_explanation: dict[str, Any]) -> str:
@@ -801,6 +898,10 @@ class ScoringService:
         if pattern["pattern_id"] in {"double_top", "double_bottom"} and pattern["status"] == "tentative":
             return "awaiting_confirmation"
         status = pattern["status"]
+        if status == "candidate":
+            if pattern["candles_ago"] > self.config.state_expiration_bars:
+                return "expired"
+            return "new" if pattern["candles_ago"] <= 1 else "active"
         if status == "failed":
             return "failed"
         if status == "expired" or pattern["candles_ago"] > pattern_max_age_bars(pattern, self.config):
@@ -845,7 +946,8 @@ class ScoringService:
     def _status_rank(self, status: str) -> int:
         return {
             "confirmed": 0,
-            "tentative": 1,
-            "failed": 2,
-            "expired": 3,
+            "candidate": 1,
+            "tentative": 2,
+            "failed": 3,
+            "expired": 4,
         }.get(status, 9)

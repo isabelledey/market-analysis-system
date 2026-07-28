@@ -46,6 +46,57 @@ def _signal_strength(row: pd.Series) -> float:
     )
 
 
+def _long_lower_rejection_geometry(row: pd.Series) -> bool:
+    candle_range = row["Candle_Range"]
+    if candle_range == 0 or pd.isna(candle_range):
+        return False
+    close_location = (row["Close"] - row["Low"]) / candle_range
+    return bool(
+        row["Lower_Wick_Ratio"] >= 0.55
+        and row["Body_Ratio"] <= 0.35
+        and close_location >= 0.60
+        and bool(row["Is_Significant_Candle"])
+    )
+
+
+def _long_upper_rejection_geometry(row: pd.Series) -> bool:
+    candle_range = row["Candle_Range"]
+    if candle_range == 0 or pd.isna(candle_range):
+        return False
+    close_location = (row["Close"] - row["Low"]) / candle_range
+    return bool(
+        row["Upper_Wick_Ratio"] >= 0.55
+        and row["Body_Ratio"] <= 0.35
+        and close_location <= 0.40
+        and bool(row["Is_Significant_Candle"])
+    )
+
+
+def _doji_geometry(row: pd.Series, config: PatternConfig) -> bool:
+    candle_range = row["Candle_Range"]
+    if candle_range == 0 or pd.isna(candle_range):
+        return False
+    return bool(row["Body_Ratio"] <= config.doji_body_ratio_max)
+
+
+@dataclass(frozen=True)
+class _PriorPatternContext:
+    direction: str
+    strength: float
+    lookback_bars: int
+    regression_score: float
+    atr_normalized_move: float
+    swing_context: str
+    quality_passed: bool
+    reason: str
+
+
+def _context_direction_matches(direction: str, expected_direction: str | None) -> bool:
+    if expected_direction is None:
+        return direction in {"uptrend", "downtrend"}
+    return direction == expected_direction
+
+
 def _gap_tolerance(*ranges: float, ratio: float) -> float:
     valid_ranges = [item for item in ranges if pd.notna(item)]
     if not valid_ranges:
@@ -176,6 +227,10 @@ class BasePatternDetector:
         strength_label: str = "regular",
         volume_baseline_source: str | None = None,
         pattern_name: str | None = None,
+        geometry_label: str = "unknown",
+        context_tags: tuple[str, ...] = (),
+        context_bias: str = "Neutral",
+        context_quality: str = "unknown",
     ) -> PatternEvent:
         final_bar_index = final_index
         detected_bar_index = final_index if detected_at_index is None else detected_at_index
@@ -230,6 +285,10 @@ class BasePatternDetector:
                 if volume_baseline_source is not None
                 else str(row.get("Volume_Baseline_Source", "unknown"))
             ),
+            geometry_label=geometry_label,
+            context_tags=context_tags,
+            context_bias=context_bias,
+            context_quality=context_quality,
         )
 
 
@@ -348,19 +407,35 @@ class BullishPinBarDetector(BasePatternDetector):
     def detect(self, data: pd.DataFrame, config: PatternConfig, interval: str) -> list[PatternEvent]:
         events: list[PatternEvent] = []
         for index, row in data.iterrows():
-            candle_range = row["Candle_Range"]
-            if candle_range == 0 or pd.isna(candle_range):
-                continue
-            close_location = (row["Close"] - row["Low"]) / candle_range
-            if not (
-                row["Lower_Wick_Ratio"] >= 0.55
-                and row["Body_Ratio"] <= 0.35
-                and close_location >= 0.60
-                and bool(row["Is_Significant_Candle"])
-            ):
+            if not _long_lower_rejection_geometry(row):
                 continue
 
+            context = classify_prior_pattern_context(
+                data,
+                int(index),
+                config,
+                expected_direction="downtrend",
+            )
             volume_source = str(row.get("Volume_Baseline_Source", "unknown"))
+            if context.quality_passed:
+                bias = "Bullish"
+                status = PatternStatus.CONFIRMED
+                context_quality = "validated"
+                detection_reason = (
+                    "A long lower wick and strong close matched bullish pin-bar geometry, and the "
+                    f"prefix-only prior context qualified as a downtrend ({context.reason}) with the "
+                    f"{volume_source} volume baseline."
+                )
+            else:
+                bias = "Neutral"
+                status = PatternStatus.CANDIDATE
+                context_quality = "geometry_only"
+                detection_reason = (
+                    "A long lower wick and strong close matched bullish pin-bar geometry, but the "
+                    f"prefix-only prior context did not qualify as a downtrend ({context.reason}), so "
+                    f"the candle remains a neutral geometry-only candidate with the {volume_source} "
+                    "volume baseline."
+                )
             events.append(
                 self._build_event(
                     data,
@@ -374,10 +449,23 @@ class BullishPinBarDetector(BasePatternDetector):
                         "low": float(row["Low"]),
                         "close": float(row["Close"]),
                     },
-                    detection_reason=(
-                        "A long lower wick and strong close marked a bullish pin bar on candle close "
-                        f"with the {volume_source} volume baseline."
+                    detection_reason=detection_reason,
+                    status=status,
+                    bias=bias,
+                    pattern_name=(
+                        "Bullish Pin Bar"
+                        if context.quality_passed
+                        else "Lower-Wick Rejection"
                     ),
+                    geometry_label="long_lower_rejection",
+                    context_tags=(
+                        "single_candle",
+                        "bullish_rejection",
+                        "context_validated" if context.quality_passed else "geometry_first",
+                        f"prior_context_{context.direction}",
+                    ),
+                    context_bias="Bullish" if context.quality_passed else "Neutral",
+                    context_quality=context_quality,
                 )
             )
         return events
@@ -398,18 +486,16 @@ class HammerDetector(BasePatternDetector):
     def detect(self, data: pd.DataFrame, config: PatternConfig, interval: str) -> list[PatternEvent]:
         events: list[PatternEvent] = []
         for index, row in data.iterrows():
-            candle_range = row["Candle_Range"]
-            if candle_range == 0 or pd.isna(candle_range):
+            if not _long_lower_rejection_geometry(row):
                 continue
-            close_location = (row["Close"] - row["Low"]) / candle_range
-            trend_context = str(row.get("Trend", "Neutral")) == "Downtrend"
-            if not (
-                trend_context
-                and row["Lower_Wick_Ratio"] >= 0.55
-                and row["Body_Ratio"] <= 0.35
-                and close_location >= 0.60
-                and bool(row["Is_Significant_Candle"])
-            ):
+
+            context = classify_prior_pattern_context(
+                data,
+                int(index),
+                config,
+                expected_direction="downtrend",
+            )
+            if not context.quality_passed:
                 continue
 
             volume_source = str(row.get("Volume_Baseline_Source", "unknown"))
@@ -427,10 +513,20 @@ class HammerDetector(BasePatternDetector):
                         "close": float(row["Close"]),
                     },
                     detection_reason=(
-                        "A hammer formed after a downtrend: the small body met the configured "
-                        "tolerance, the lower wick showed bullish rejection, and the candle only "
-                        f"became knowable on the close with the {volume_source} volume baseline."
+                        "A hammer formed after a qualifying prefix-only downtrend: the small body "
+                        "met the configured tolerance, the lower wick showed bullish rejection, "
+                        f"and the prior context passed validation ({context.reason}) with the "
+                        f"{volume_source} volume baseline."
                     ),
+                    geometry_label="long_lower_rejection",
+                    context_tags=(
+                        "single_candle",
+                        "bullish_rejection",
+                        "downtrend_context",
+                        f"prior_context_{context.direction}",
+                    ),
+                    context_bias="Bullish",
+                    context_quality="validated",
                 )
             )
         return events
@@ -451,19 +547,35 @@ class ShootingStarDetector(BasePatternDetector):
     def detect(self, data: pd.DataFrame, config: PatternConfig, interval: str) -> list[PatternEvent]:
         events: list[PatternEvent] = []
         for index, row in data.iterrows():
-            candle_range = row["Candle_Range"]
-            if candle_range == 0 or pd.isna(candle_range):
-                continue
-            close_location = (row["Close"] - row["Low"]) / candle_range
-            if not (
-                row["Upper_Wick_Ratio"] >= 0.55
-                and row["Body_Ratio"] <= 0.35
-                and close_location <= 0.40
-                and bool(row["Is_Significant_Candle"])
-            ):
+            if not _long_upper_rejection_geometry(row):
                 continue
 
+            context = classify_prior_pattern_context(
+                data,
+                int(index),
+                config,
+                expected_direction="uptrend",
+            )
             volume_source = str(row.get("Volume_Baseline_Source", "unknown"))
+            if context.quality_passed:
+                bias = "Bearish"
+                status = PatternStatus.CONFIRMED
+                context_quality = "validated"
+                detection_reason = (
+                    "A long upper wick and weak close matched shooting-star geometry, and the "
+                    f"prefix-only prior context qualified as an uptrend ({context.reason}) with the "
+                    f"{volume_source} volume baseline."
+                )
+            else:
+                bias = "Neutral"
+                status = PatternStatus.CANDIDATE
+                context_quality = "geometry_only"
+                detection_reason = (
+                    "A long upper wick and weak close matched shooting-star geometry, but the "
+                    f"prefix-only prior context did not qualify as an uptrend ({context.reason}), so "
+                    f"the candle remains a neutral geometry-only candidate with the {volume_source} "
+                    "volume baseline."
+                )
             events.append(
                 self._build_event(
                     data,
@@ -477,10 +589,23 @@ class ShootingStarDetector(BasePatternDetector):
                         "low": float(row["Low"]),
                         "close": float(row["Close"]),
                     },
-                    detection_reason=(
-                        "A long upper wick and weak close marked a shooting star on candle close "
-                        f"with the {volume_source} volume baseline."
+                    detection_reason=detection_reason,
+                    status=status,
+                    bias=bias,
+                    pattern_name=(
+                        "Shooting Star"
+                        if context.quality_passed
+                        else "Upper-Wick Rejection"
                     ),
+                    geometry_label="long_upper_rejection",
+                    context_tags=(
+                        "single_candle",
+                        "bearish_rejection",
+                        "context_validated" if context.quality_passed else "geometry_first",
+                        f"prior_context_{context.direction}",
+                    ),
+                    context_bias="Bearish" if context.quality_passed else "Neutral",
+                    context_quality=context_quality,
                 )
             )
         return events
@@ -809,10 +934,7 @@ class DojiDetector(BasePatternDetector):
     def detect(self, data: pd.DataFrame, config: PatternConfig, interval: str) -> list[PatternEvent]:
         events: list[PatternEvent] = []
         for index, row in data.iterrows():
-            candle_range = row["Candle_Range"]
-            if candle_range == 0 or pd.isna(candle_range):
-                continue
-            if row["Body_Ratio"] > config.doji_body_ratio_max:
+            if not _doji_geometry(row, config):
                 continue
             events.append(
                 self._build_event(
@@ -831,7 +953,13 @@ class DojiDetector(BasePatternDetector):
                         "The candle body stayed within the configured doji tolerance and became "
                         "knowable only after the bar closed."
                     ),
+                    status=PatternStatus.CANDIDATE,
+                    bias="Neutral",
                     signal_strength=round(1.0 - min(float(row["Body_Ratio"]), 1.0), 2),
+                    geometry_label="doji",
+                    context_tags=("single_candle", "indecision", "geometry_first"),
+                    context_bias="Neutral",
+                    context_quality="geometry_only",
                 )
             )
         return events
@@ -1416,6 +1544,7 @@ class _TrendSnapshot:
     score: float
     label: str
     evidence: list[str]
+    evidence_items: list[dict[str, object]]
 
 
 @dataclass(frozen=True)
@@ -1446,6 +1575,114 @@ def _relative_move(reference: float, comparison: float, tolerance: float) -> int
     if comparison < reference * (1.0 - tolerance):
         return -1
     return 0
+
+
+def classify_prior_pattern_context(
+    data: pd.DataFrame,
+    pattern_index: int,
+    config: PatternConfig,
+    *,
+    expected_direction: str | None = None,
+) -> _PriorPatternContext:
+    prefix = data.iloc[:pattern_index].copy().reset_index(drop=True)
+    if len(prefix) < 8:
+        return _PriorPatternContext(
+            direction="ambiguous",
+            strength=0.0,
+            lookback_bars=len(prefix),
+            regression_score=0.0,
+            atr_normalized_move=0.0,
+            swing_context="insufficient_history",
+            quality_passed=False,
+            reason="fewer than 8 completed bars existed before the pattern candle",
+        )
+
+    short_horizon, _, _ = _trend_horizons(max(config.breakout_lookback, 12))
+    lookback_bars = min(len(prefix), max(12, short_horizon))
+    window = prefix.tail(lookback_bars).reset_index(drop=True)
+    closes = window["Close"].astype(float).to_numpy(copy=False)
+    highs = window["High"].astype(float).to_numpy(copy=False)
+    lows = window["Low"].astype(float).to_numpy(copy=False)
+    returns = (
+        window.get("Bar_Return", pd.Series(closes).pct_change())
+        .fillna(0.0)
+        .astype(float)
+        .to_numpy()
+    )
+
+    atr_scale = float(np.nanmean(highs - lows))
+    atr_scale = atr_scale if atr_scale > 1e-9 else max(abs(float(closes[-1])) * 0.001, 1e-6)
+    regression_x = np.arange(len(closes), dtype=float)
+    regression_slope = float(np.polyfit(regression_x, closes, 1)[0])
+    regression_score = float(np.clip((regression_slope / atr_scale) * 80.0, -24.0, 24.0))
+    atr_normalized_move = round(float((closes[-1] - closes[0]) / atr_scale), 2)
+
+    swing_highs, swing_lows = _confirmed_swings_from_arrays(
+        highs,
+        lows,
+        pivot_left_bars=config.pivot_left_bars,
+        pivot_right_bars=config.pivot_right_bars,
+    )
+    high_direction = 0
+    low_direction = 0
+    if len(swing_highs) >= 2:
+        high_direction = _relative_move(swing_highs[-2][1], swing_highs[-1][1], 0.003)
+    if len(swing_lows) >= 2:
+        low_direction = _relative_move(swing_lows[-2][1], swing_lows[-1][1], 0.003)
+    if high_direction > 0 and low_direction > 0:
+        swing_context = "higher_highs_and_higher_lows"
+    elif high_direction < 0 and low_direction < 0:
+        swing_context = "lower_highs_and_lower_lows"
+    elif high_direction == 0 and low_direction == 0:
+        swing_context = "mixed_or_flat"
+    else:
+        swing_context = "mixed_swings"
+
+    break_score, _ = _break_structure_score(
+        prefix,
+        breakout_lookback=config.breakout_lookback,
+    )
+    snapshot = _trend_snapshot(
+        prefix,
+        horizon=lookback_bars,
+        pivot_left_bars=config.pivot_left_bars,
+        pivot_right_bars=config.pivot_right_bars,
+        breakout_lookback=config.breakout_lookback,
+    )
+
+    if snapshot.label == "Uptrend" and atr_normalized_move >= 1.25:
+        direction = "uptrend"
+    elif snapshot.label == "Downtrend" and atr_normalized_move <= -1.25:
+        direction = "downtrend"
+    elif abs(snapshot.score) >= 16.0 and abs(atr_normalized_move) >= 1.0:
+        direction = "uptrend" if snapshot.score > 0 else "downtrend"
+    elif abs(snapshot.score) >= 10.0:
+        direction = "sideways"
+    else:
+        direction = "ambiguous"
+
+    quality_passed = (
+        _context_direction_matches(direction, expected_direction)
+        and abs(snapshot.score) >= 18.0
+        and abs(regression_score) >= 6.0
+        and abs(atr_normalized_move) >= 1.25
+    )
+    reason = (
+        f"{direction} context over {lookback_bars} prior bars "
+        f"(trend score {snapshot.score:.2f}, regression {regression_score:.2f}, "
+        f"ATR-normalized move {atr_normalized_move:.2f}, swing context {swing_context}, "
+        f"break score {break_score:.2f})"
+    )
+    return _PriorPatternContext(
+        direction=direction,
+        strength=round(abs(snapshot.score), 2),
+        lookback_bars=lookback_bars,
+        regression_score=round(regression_score, 2),
+        atr_normalized_move=atr_normalized_move,
+        swing_context=swing_context,
+        quality_passed=quality_passed,
+        reason=reason,
+    )
 
 
 def _pattern_session_key_values(data: pd.DataFrame) -> np.ndarray:
@@ -1556,11 +1793,12 @@ def _prefix_break_structure_scores(
         score = 0.0
         for event in events[:event_position]:
             bars_ago = end_index - event.index
-            candidate = float(event.base_score) - (bars_ago * 2.0)
-            if event.direction > 0:
-                score = max(score, candidate)
-            else:
-                score = min(score, -max(4.0, candidate))
+            decayed_magnitude = max(0.0, float(event.base_score) - (bars_ago * 2.0))
+            signed_candidate = float(event.direction) * decayed_magnitude
+            if signed_candidate > 0:
+                score = max(score, signed_candidate)
+            elif signed_candidate < 0:
+                score = min(score, signed_candidate)
         scores[end_index] = score
     return scores
 
@@ -1593,9 +1831,10 @@ def _trend_snapshot_from_arrays(
     pivot_right_bars: int,
     breakout_lookback: int,
     raw_break_score: float,
+    horizon_label: str = "Composite",
 ) -> _TrendSnapshot:
     if len(closes) < 8:
-        return _TrendSnapshot(score=0.0, label="Neutral", evidence=[])
+        return _TrendSnapshot(score=0.0, label="Neutral", evidence=[], evidence_items=[])
 
     atr_scale = float(np.nanmean(highs - lows))
     atr_scale = atr_scale if atr_scale > 1e-9 else max(abs(float(closes[-1])) * 0.001, 1e-6)
@@ -1656,28 +1895,122 @@ def _trend_snapshot_from_arrays(
     score = float(np.clip(raw_score, -100.0, 100.0))
 
     evidence: list[str] = []
+    evidence_items: list[dict[str, object]] = []
+
+    def append_evidence(
+        *,
+        evidence_type: str,
+        direction: str,
+        raw_feature_value: float,
+        score_contribution: float,
+        explanation: str,
+    ) -> None:
+        evidence.append(explanation)
+        evidence_items.append(
+            {
+                "type": evidence_type,
+                "direction": direction,
+                "horizon": horizon_label,
+                "raw_feature_value": round(raw_feature_value, 4),
+                "score_contribution": round(score_contribution, 2),
+                "evaluation_index": int(len(closes) - 1),
+                "supports_composite_trend": False,
+                "conflicts_with_composite_trend": False,
+                "explanation": explanation,
+            }
+        )
+
     if slope_score >= 6.0:
-        evidence.append("Recent close regression slope was positive after range normalization.")
+        append_evidence(
+            evidence_type="regression_slope",
+            direction="Bullish",
+            raw_feature_value=slope,
+            score_contribution=slope_score,
+            explanation="Recent close regression slope was positive after range normalization.",
+        )
     elif slope_score <= -6.0:
-        evidence.append("Recent close regression slope was negative after range normalization.")
+        append_evidence(
+            evidence_type="regression_slope",
+            direction="Bearish",
+            raw_feature_value=slope,
+            score_contribution=slope_score,
+            explanation="Recent close regression slope was negative after range normalization.",
+        )
 
     if ma_score >= 8.0:
-        evidence.append("Price and moving-average alignment stayed bullish across the recent horizon.")
+        append_evidence(
+            evidence_type="moving_average_alignment",
+            direction="Bullish",
+            raw_feature_value=ma_separation,
+            score_contribution=ma_score,
+            explanation="Price and moving-average alignment stayed bullish across the recent horizon.",
+        )
     elif ma_score <= -8.0:
-        evidence.append("Price and moving-average alignment stayed bearish across the recent horizon.")
+        append_evidence(
+            evidence_type="moving_average_alignment",
+            direction="Bearish",
+            raw_feature_value=ma_separation,
+            score_contribution=ma_score,
+            explanation="Price and moving-average alignment stayed bearish across the recent horizon.",
+        )
 
     if swing_score >= 7.0:
-        evidence.append("Confirmed swing highs and lows were progressing upward.")
+        append_evidence(
+            evidence_type="swing_structure",
+            direction="Bullish",
+            raw_feature_value=swing_score,
+            score_contribution=swing_score,
+            explanation="Confirmed swing highs and lows were progressing upward.",
+        )
     elif swing_score <= -7.0:
-        evidence.append("Confirmed swing highs and lows were progressing downward.")
+        append_evidence(
+            evidence_type="swing_structure",
+            direction="Bearish",
+            raw_feature_value=swing_score,
+            score_contribution=swing_score,
+            explanation="Confirmed swing highs and lows were progressing downward.",
+        )
 
     if persistence_score >= 4.0:
-        evidence.append("Directional persistence favored bullish closes over the recent bars.")
+        append_evidence(
+            evidence_type="directional_persistence",
+            direction="Bullish",
+            raw_feature_value=bullish_persistence - bearish_persistence,
+            score_contribution=persistence_score,
+            explanation="Directional persistence favored bullish closes over the recent bars.",
+        )
     elif persistence_score <= -4.0:
-        evidence.append("Directional persistence favored bearish closes over the recent bars.")
+        append_evidence(
+            evidence_type="directional_persistence",
+            direction="Bearish",
+            raw_feature_value=bullish_persistence - bearish_persistence,
+            score_contribution=persistence_score,
+            explanation="Directional persistence favored bearish closes over the recent bars.",
+        )
 
-    evidence.extend(break_evidence)
-    return _TrendSnapshot(score=round(score, 2), label=_trend_label(score), evidence=evidence)
+    if break_score >= 4.0:
+        append_evidence(
+            evidence_type="break_structure",
+            direction="Bullish",
+            raw_feature_value=break_score,
+            score_contribution=break_score,
+            explanation=break_evidence[0],
+        )
+    elif break_score <= -4.0:
+        append_evidence(
+            evidence_type="break_structure",
+            direction="Bearish",
+            raw_feature_value=break_score,
+            score_contribution=break_score,
+            explanation=break_evidence[0],
+        )
+
+    return _TrendSnapshot(
+        score=round(score, 2),
+        label=_trend_label(score),
+        evidence=evidence,
+        evidence_items=evidence_items,
+    )
 
 
 def _confirmed_swings(
@@ -1764,6 +2097,7 @@ def classify_intraday_trend(
     trend_scores: list[float] = []
     trend_labels: list[str] = []
     trend_evidence: list[list[str]] = []
+    trend_evidence_structured: list[list[dict[str, object]]] = []
     trend_horizons: list[str] = []
     trend_lookbacks: list[int] = []
 
@@ -1781,6 +2115,11 @@ def classify_intraday_trend(
                 pivot_right_bars=pivot_right_bars,
                 breakout_lookback=breakout_lookback,
                 raw_break_score=break_score,
+                horizon_label=(
+                    "Short-term"
+                    if horizon == short_horizon
+                    else ("Medium-term" if horizon == medium_horizon else "Long-term")
+                ),
             )
 
         short_snapshot = build_snapshot(short_horizon)
@@ -1801,19 +2140,37 @@ def classify_intraday_trend(
 
         composite_score = round(sum(weighted_scores) / sum(weights), 2) if weights else 0.0
         composite_label = _trend_label(composite_score)
-        evidence = list(dict.fromkeys(short_snapshot.evidence + medium_snapshot.evidence))
-        if composite_label == "Downtrend" and bool(bullish_values[index]):
-            evidence.append(
-                "A recent bullish candle was treated as a counter-trend reaction, not a confirmed reversal."
-            )
-        elif composite_label == "Uptrend" and bool(bearish_values[index]):
-            evidence.append(
-                "A recent bearish candle was treated as a counter-trend reaction, not a confirmed reversal."
-            )
-        if not evidence:
-            evidence.append(
-                "Slope, moving averages, swing structure, and recent breaks were too mixed to confirm a trend."
-            )
+        structured_evidence: list[dict[str, object]] = []
+        for snapshot in (short_snapshot, medium_snapshot, long_snapshot):
+            for item in snapshot.evidence_items:
+                enriched_item = dict(item)
+                if composite_label == "Uptrend":
+                    enriched_item["supports_composite_trend"] = item["direction"] == "Bullish"
+                    enriched_item["conflicts_with_composite_trend"] = item["direction"] == "Bearish"
+                elif composite_label == "Downtrend":
+                    enriched_item["supports_composite_trend"] = item["direction"] == "Bearish"
+                    enriched_item["conflicts_with_composite_trend"] = item["direction"] == "Bullish"
+                structured_evidence.append(enriched_item)
+
+        evidence = [
+            f"[{item['horizon']}, {item['direction']}"
+            f"{' Conflict' if item['conflicts_with_composite_trend'] else ''}] {item['explanation']}"
+            for item in structured_evidence
+        ]
+        if not structured_evidence:
+            neutral_item = {
+                "type": "composite_neutrality",
+                "direction": "Neutral",
+                "horizon": "Composite",
+                "raw_feature_value": 0.0,
+                "score_contribution": 0.0,
+                "evaluation_index": int(index),
+                "supports_composite_trend": False,
+                "conflicts_with_composite_trend": False,
+                "explanation": "Slope, moving averages, swing structure, and recent breaks were too mixed to confirm a trend.",
+            }
+            structured_evidence.append(neutral_item)
+            evidence = [f"[Composite, Neutral] {neutral_item['explanation']}"]
 
         short_scores.append(short_snapshot.score)
         medium_scores.append(medium_snapshot.score)
@@ -1824,6 +2181,7 @@ def classify_intraday_trend(
         trend_scores.append(composite_score)
         trend_labels.append(composite_label)
         trend_evidence.append(evidence)
+        trend_evidence_structured.append(structured_evidence)
         trend_horizons.append("Short-to-medium term")
         trend_lookbacks.append(medium_horizon)
 
@@ -1836,6 +2194,7 @@ def classify_intraday_trend(
     pattern_df["Trend"] = trend_labels
     pattern_df["Trend_Score"] = trend_scores
     pattern_df["Trend_Evidence"] = trend_evidence
+    pattern_df["Trend_Evidence_Structured"] = trend_evidence_structured
     pattern_df["Trend_Horizon"] = trend_horizons
     pattern_df["Trend_Lookback_Bars"] = trend_lookbacks
     return pattern_df

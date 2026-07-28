@@ -36,6 +36,13 @@ def format_analysis_text(
     instrument = result.get("instrument", {})
     current_patterns = result.get("current_relevant_patterns") or []
     session_history = result.get("session_pattern_history") or []
+    current_contributing = result.get("current_contributing_evidence") or []
+    awaiting_confirmation = result.get("awaiting_confirmation_evidence") or []
+    current_conflicting = result.get("current_conflicting_evidence") or []
+    current_neutral = result.get("current_neutral_evidence") or []
+    historical_lifecycle = result.get("historical_lifecycle_events") or []
+    recent_non_contributing = result.get("recent_non_contributing_tracked_events") or []
+    historical_summary = result.get("historical_lifecycle_summary") or {}
     raw_pattern_key = "all_detected_patterns" if include_all_patterns else "top_patterns"
     raw_patterns = result.get(raw_pattern_key, [])
     if history_limit is not None:
@@ -68,8 +75,8 @@ def format_analysis_text(
         f"Trend Horizon: {result.get('trend_horizon', 'Unknown')}",
         f"Market State: {result.get('market_state', 'Unknown')}",
         f"Overall Bias: {result.get('overall_bias', 'Unknown')}",
-        f"Bullish Score: {result.get('bullish_score', 'Unknown')}",
-        f"Bearish Score: {result.get('bearish_score', 'Unknown')}",
+        f"Bullish Pattern Score: {result.get('bullish_pattern_score', result.get('bullish_score', 'Unknown'))}",
+        f"Bearish Pattern Score: {result.get('bearish_pattern_score', result.get('bearish_score', 'Unknown'))}",
         f"Rule Confidence: {result.get('rule_confidence', 'Unknown')}",
         f"Trend Score: {result.get('trend_score', 'Unknown')}",
         f"Trend Signal Contribution: {result.get('trend_signal_score', 'Unknown')}",
@@ -79,17 +86,31 @@ def format_analysis_text(
         f"Short-Term Trend: {result.get('short_term_trend', 'Unknown')} ({result.get('short_term_trend_score', 'Unknown')})",
         f"Medium-Term Trend: {result.get('medium_term_trend', 'Unknown')} ({result.get('medium_term_trend_score', 'Unknown')})",
         f"Long-Term Trend: {result.get('long_term_trend', 'Unknown')} ({result.get('long_term_trend_score', 'Unknown')})",
-        f"Current Active Evidence ({len(current_patterns)}):",
+        f"Current Contributing Evidence Count: {len(current_contributing)}",
+        f"Awaiting Confirmation Count: {len(awaiting_confirmation)}",
+        f"Current Conflicting Evidence Count: {len(current_conflicting)}",
+        f"Current Neutral Evidence Count: {len(current_neutral)}",
+        f"Recent Non-Contributing Tracked Event Count: {len(recent_non_contributing)}",
+        f"Historical Lifecycle Event Count: {len(historical_lifecycle)}",
     ]
 
-    if current_patterns:
-        for pattern in current_patterns:
+    def append_event_section(title: str, patterns: list[dict[str, Any]]) -> None:
+        lines.append(f"{title} ({len(patterns)}):")
+        if not patterns:
+            lines.append("  None")
+            return
+        for pattern in patterns:
             labels = ", ".join(pattern.get("pattern_labels", [pattern.get("primary_pattern_name", "Unknown")]))
             lines.append(f"  Name: {pattern.get('primary_pattern_name', 'Unknown')}")
             lines.append(f"  Pattern Labels: {labels}")
+            if pattern.get("raw_geometry_labels"):
+                lines.append(f"  Raw Geometry Labels: {', '.join(pattern['raw_geometry_labels'])}")
             lines.append(f"  Family: {pattern.get('family', 'unknown')}")
             lines.append(f"  State: {pattern.get('state', 'unknown')}")
+            lines.append(f"  Status: {pattern.get('status', 'unknown')}")
             lines.append(f"  Bias: {pattern.get('bias', 'Unknown')}")
+            lines.append(f"  Geometry: {pattern.get('geometry_label', 'unknown')}")
+            lines.append(f"  Context Quality: {pattern.get('context_quality', 'unknown')}")
             lines.append(f"  Pattern Start: {pattern.get('pattern_start_display', 'Unknown')}")
             lines.append(f"  Setup Completion: {pattern.get('setup_completion_display', pattern.get('pattern_completion_display', 'Unknown'))}")
             lines.append(f"  Pattern Completion: {pattern.get('pattern_completion_display', 'Unknown')}")
@@ -99,7 +120,11 @@ def format_analysis_text(
             _append_transition_lines(lines, pattern, indent="  ")
             lines.append(f"  Display Timezone: {pattern.get('display_timezone', 'Unknown')}")
             lines.append(f"  Signal Strength: {pattern.get('signal_strength', 'Unknown')}")
-            lines.append(f"  Current Score Contribution: {pattern.get('current_weighted_score', 0.0)}")
+            lines.append(f"  Pattern Score Contribution: {pattern.get('pattern_score_contribution', 0.0)}")
+            lines.append(f"  Volume Score Contribution: {pattern.get('volume_score_contribution', 0.0)}")
+            lines.append(f"  Combined Event Contribution: {pattern.get('combined_event_contribution', pattern.get('current_weighted_score', 0.0))}")
+            lines.append(f"  Recency Weight: {pattern.get('recency_weight', 'Unknown')}")
+            lines.append(f"  Score Eligible: {'Yes' if pattern.get('score_eligible') else 'No'}")
             lines.append(f"  Included in Current Score: {'Yes' if pattern.get('included_in_current_score') else 'No'}")
             if pattern.get("invalidation_condition"):
                 lines.append(f"  Invalidation Condition: {pattern['invalidation_condition']}")
@@ -109,6 +134,16 @@ def format_analysis_text(
                 lines.append(f"  Overlap Note: {pattern['overlap_note']}")
             if pattern.get("related_note"):
                 lines.append(f"  Relationship Note: {pattern['related_note']}")
+
+    append_event_section("Current Contributing Evidence", current_contributing)
+    append_event_section("Awaiting Confirmation", awaiting_confirmation)
+    append_event_section("Conflicting Evidence", current_conflicting)
+    append_event_section("Current Neutral / Informational Evidence", current_neutral)
+    append_event_section("Recent Non-Contributing Tracked Events", recent_non_contributing)
+
+    lines.append(f"Deprecated Current Relevant Patterns ({len(current_patterns)}):")
+    if current_patterns:
+        lines.append("  This alias is deprecated and mirrors the current display collections above.")
     else:
         lines.append("  None")
 
@@ -150,6 +185,22 @@ def format_analysis_text(
                     lines.append(f"     Relationship Note: {pattern['related_note']}")
         else:
             lines.append("  None")
+
+    lines.append("Historical Lifecycle Summary:")
+    if historical_summary:
+        lines.append(f"  Total Historical Lifecycle Events: {historical_summary.get('count', len(historical_lifecycle))}")
+        if historical_summary.get("by_state"):
+            lines.append(
+                "  By State: "
+                + ", ".join(f"{state}={count}" for state, count in historical_summary["by_state"].items())
+            )
+        if historical_summary.get("by_family"):
+            lines.append(
+                "  By Family: "
+                + ", ".join(f"{family}={count}" for family, count in historical_summary["by_family"].items())
+            )
+    else:
+        lines.append("  None")
 
     if include_all_patterns:
         lines.append(f"All Historical Detected Pattern Labels ({len(raw_patterns)}):")
@@ -193,6 +244,18 @@ def format_analysis_text(
         lines.append("Trend Evidence:")
         for item in structured["trend_evidence"]:
             lines.append(f"  - {item}")
+    if structured.get("supporting_trend_evidence"):
+        lines.append("Supporting Trend Evidence:")
+        for item in structured["supporting_trend_evidence"]:
+            lines.append(f"  - {item}")
+    if structured.get("conflicting_trend_evidence"):
+        lines.append("Conflicting Trend Evidence:")
+        for item in structured["conflicting_trend_evidence"]:
+            lines.append(f"  - {item}")
+    if structured.get("neutral_trend_evidence"):
+        lines.append("Neutral Trend Evidence:")
+        for item in structured["neutral_trend_evidence"]:
+            lines.append(f"  - {item}")
     if structured.get("bullish_evidence"):
         lines.append("Bullish Evidence:")
         for item in structured["bullish_evidence"]:
@@ -227,4 +290,8 @@ def format_analysis_text(
         f"  {structured.get('reason_for_confidence', result.get('explanation', ''))} "
         "Rule confidence is an uncalibrated rule-strength score, not a probability."
     )
+    if structured.get("confidence_breakdown"):
+        lines.append("Confidence Breakdown:")
+        for key, value in structured["confidence_breakdown"].items():
+            lines.append(f"  - {key}: {value}")
     return "\n".join(lines)

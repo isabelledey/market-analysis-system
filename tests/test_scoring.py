@@ -131,9 +131,13 @@ def test_no_pattern_analysis_outputs_neutral_scores() -> None:
     assert result["volume_score"] == 0
     assert result["overall_bias"] == "Neutral"
     assert result["market_state"] in {"Trend Only", "Neutral"}
-    assert set(result["structured_explanation"]) == {
+    assert {
         "summary",
         "trend_evidence",
+        "trend_evidence_structured",
+        "supporting_trend_evidence",
+        "conflicting_trend_evidence",
+        "neutral_trend_evidence",
         "bullish_evidence",
         "bearish_evidence",
         "current_pattern_evidence",
@@ -143,7 +147,9 @@ def test_no_pattern_analysis_outputs_neutral_scores() -> None:
         "data_warnings",
         "reason_for_bias",
         "reason_for_confidence",
-    }
+        "confidence_breakdown",
+        "current_display_summary",
+    }.issubset(set(result["structured_explanation"]))
 
 
 def test_trend_only_analysis_keeps_bias_neutral() -> None:

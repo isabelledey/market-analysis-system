@@ -28,6 +28,7 @@ class PatternFamily(str, Enum):
 class PatternStatus(str, Enum):
     """Lifecycle states for pattern events."""
 
+    CANDIDATE = "candidate"
     TENTATIVE = "tentative"
     CONFIRMED = "confirmed"
     FAILED = "failed"
@@ -130,6 +131,11 @@ class PatternEvent:
     relationship_type: str | None = None
     strength_label: str = "regular"
     volume_baseline_source: str = "unknown"
+    geometry_label: str = "unknown"
+    context_tags: tuple[str, ...] = ()
+    context_bias: str = "Neutral"
+    context_quality: str = "unknown"
+    detector_version: str = "v1"
 
     def to_dict(self) -> dict[str, Any]:
         return {

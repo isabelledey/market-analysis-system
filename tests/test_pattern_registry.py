@@ -12,6 +12,7 @@ from stock_pattern_model.domain import PatternStatus
 from stock_pattern_model.features import add_features
 from stock_pattern_model.pattern_detector import BasePatternDetector
 from stock_pattern_model.pattern_detector import BullishEngulfingDetector
+from stock_pattern_model.pattern_detector import BullishPinBarDetector
 from stock_pattern_model.pattern_detector import BearishEngulfingDetector
 from stock_pattern_model.pattern_detector import BreakdownDetector
 from stock_pattern_model.pattern_detector import BreakoutDetector
@@ -21,6 +22,7 @@ from stock_pattern_model.pattern_detector import DojiDetector
 from stock_pattern_model.pattern_detector import DoubleBottomDetector
 from stock_pattern_model.pattern_detector import DoubleTopDetector
 from stock_pattern_model.pattern_detector import EveningStarDetector
+from stock_pattern_model.pattern_detector import HammerDetector
 from stock_pattern_model.pattern_detector import InsideBarDetector
 from stock_pattern_model.pattern_detector import MorningStarDetector
 from stock_pattern_model.pattern_detector import ShootingStarDetector
@@ -250,7 +252,11 @@ def test_additional_pattern_detectors_emit_expected_events() -> None:
     shooting_star_df.loc[24, ["Open", "High", "Low", "Close", "Volume"]] = [100.2, 101.5, 100.1, 100.3, 2600]
     shooting_star_events = ShootingStarDetector().detect(add_features(shooting_star_df), PatternConfig(), "15m")
     assert len(shooting_star_events) == 1
-    assert shooting_star_events[0].pattern_name == "Shooting Star"
+    assert shooting_star_events[0].pattern_name == "Upper-Wick Rejection"
+    assert shooting_star_events[0].bias == "Neutral"
+    assert shooting_star_events[0].status is PatternStatus.CANDIDATE
+    assert shooting_star_events[0].geometry_label == "long_upper_rejection"
+    assert shooting_star_events[0].context_quality == "geometry_only"
 
     inside_bar_df = make_base_df(25)
     inside_bar_df.loc[23, ["Open", "High", "Low", "Close", "Volume"]] = [100.0, 105.0, 95.0, 102.0, 2600]
@@ -258,6 +264,42 @@ def test_additional_pattern_detectors_emit_expected_events() -> None:
     inside_bar_events = InsideBarDetector().detect(add_features(inside_bar_df), PatternConfig(), "15m")
     assert len(inside_bar_events) == 1
     assert inside_bar_events[0].pattern_name == "Inside Bar"
+
+
+def test_single_candle_rejection_patterns_expose_geometry_and_context_metadata() -> None:
+    hammer_df = make_base_df(25)
+    for index in range(len(hammer_df)):
+        close_price = 110.0 - (index * 0.45)
+        open_price = close_price + 0.18
+        hammer_df.loc[index, ["Open", "High", "Low", "Close"]] = [
+            open_price,
+            open_price + 0.22,
+            close_price - 0.22,
+            close_price,
+        ]
+    hammer_df.loc[24, ["Open", "High", "Low", "Close", "Volume"]] = [96.0, 96.1, 94.4, 96.0, 4200]
+
+    pin_df = make_base_df(25)
+    pin_df.loc[24, ["Open", "High", "Low", "Close", "Volume"]] = [100.4, 100.6, 99.5, 100.55, 3600]
+
+    classified_hammer_df = classify_intraday_trend(
+        add_features(hammer_df),
+        lookback_bars=12,
+        pivot_left_bars=2,
+        pivot_right_bars=2,
+        breakout_lookback=20,
+    )
+    hammer_events = HammerDetector().detect(classified_hammer_df, PatternConfig(), "15m")
+    pin_events = BullishPinBarDetector().detect(add_features(pin_df), PatternConfig(), "15m")
+
+    assert hammer_events
+    assert pin_events
+    assert hammer_events[0].geometry_label == "long_lower_rejection"
+    assert hammer_events[0].context_quality == "validated"
+    assert "downtrend_context" in hammer_events[0].context_tags
+    assert pin_events[0].geometry_label == "long_lower_rejection"
+    assert pin_events[0].context_quality == "geometry_only"
+    assert "geometry_first" in pin_events[0].context_tags
 
     breakdown_df = make_base_df(30)
     breakdown_df.loc[20, ["Open", "High", "Low", "Close", "Volume"]] = [100.10, 100.20, 99.00, 99.10, 2600]
@@ -278,6 +320,101 @@ def test_additional_pattern_detectors_emit_expected_events() -> None:
     evening_star_events = EveningStarDetector().detect(add_features(evening_star_df), PatternConfig(), "15m")
     assert len(evening_star_events) == 1
     assert evening_star_events[0].pattern_name == "Evening Star"
+
+
+def test_long_rejection_geometry_resolves_differently_by_prior_context() -> None:
+    config = PatternConfig()
+
+    uptrend_df = make_base_df(25)
+    for index in range(len(uptrend_df) - 1):
+        close_price = 100.0 + (index * 0.4)
+        open_price = close_price - 0.12
+        uptrend_df.loc[index, ["Open", "High", "Low", "Close"]] = [
+            open_price,
+            close_price + 0.22,
+            open_price - 0.18,
+            close_price,
+        ]
+    uptrend_df.loc[24, ["Open", "High", "Low", "Close", "Volume"]] = [109.8, 111.2, 109.7, 109.9, 3600]
+
+    downtrend_df = make_base_df(25)
+    for index in range(len(downtrend_df) - 1):
+        close_price = 110.0 - (index * 0.4)
+        open_price = close_price + 0.12
+        downtrend_df.loc[index, ["Open", "High", "Low", "Close"]] = [
+            open_price,
+            open_price + 0.18,
+            close_price - 0.22,
+            close_price,
+        ]
+    downtrend_df.loc[24, ["Open", "High", "Low", "Close", "Volume"]] = [100.2, 101.5, 100.1, 100.3, 3600]
+
+    sideways_df = make_base_df(25)
+    for index in range(len(sideways_df) - 1):
+        close_price = 100.0 + ((index % 3) - 1) * 0.08
+        open_price = close_price - 0.02 if index % 2 == 0 else close_price + 0.02
+        sideways_df.loc[index, ["Open", "High", "Low", "Close"]] = [
+            open_price,
+            max(open_price, close_price) + 0.18,
+            min(open_price, close_price) - 0.18,
+            close_price,
+        ]
+    sideways_df.loc[24, ["Open", "High", "Low", "Close", "Volume"]] = [100.1, 101.45, 100.0, 100.2, 3600]
+
+    uptrend_event = ShootingStarDetector().detect(add_features(uptrend_df), config, "15m")[0]
+    downtrend_event = ShootingStarDetector().detect(add_features(downtrend_df), config, "15m")[0]
+    sideways_event = ShootingStarDetector().detect(add_features(sideways_df), config, "15m")[0]
+
+    assert uptrend_event.pattern_name == "Shooting Star"
+    assert uptrend_event.bias == "Bearish"
+    assert uptrend_event.context_quality == "validated"
+
+    assert downtrend_event.pattern_name == "Upper-Wick Rejection"
+    assert downtrend_event.bias == "Neutral"
+    assert downtrend_event.status is PatternStatus.CANDIDATE
+
+    assert sideways_event.pattern_name == "Upper-Wick Rejection"
+    assert sideways_event.bias == "Neutral"
+    assert sideways_event.context_quality == "geometry_only"
+
+
+def test_single_candle_context_uses_prefix_only_not_future_bars() -> None:
+    base_df = make_base_df(25)
+    for index in range(len(base_df) - 1):
+        close_price = 110.0 - (index * 0.45)
+        open_price = close_price + 0.18
+        base_df.loc[index, ["Open", "High", "Low", "Close"]] = [
+            open_price,
+            open_price + 0.22,
+            close_price - 0.22,
+            close_price,
+        ]
+    base_df.loc[24, ["Open", "High", "Low", "Close", "Volume"]] = [96.0, 96.1, 94.4, 96.0, 4200]
+
+    future_variant = pd.concat(
+        [
+            base_df,
+            make_df(
+                [
+                    candle(96.0, 96.3, 95.9, 96.2, 1800),
+                    candle(96.1, 97.4, 95.8, 97.2, 5200),
+                    candle(97.0, 97.2, 95.5, 95.8, 4900),
+                ],
+                start="2026-07-10 15:45",
+            ),
+        ],
+        ignore_index=True,
+    )
+
+    base_events = HammerDetector().detect(add_features(base_df), PatternConfig(), "15m")
+    variant_events = HammerDetector().detect(add_features(future_variant), PatternConfig(), "15m")
+
+    assert base_events and variant_events
+    base_event = next(event for event in base_events if event.detected_at == pd.Timestamp("2026-07-10 15:45", tz=EXCHANGE_TZ))
+    variant_event = next(event for event in variant_events if event.detected_at == pd.Timestamp("2026-07-10 15:45", tz=EXCHANGE_TZ))
+    assert base_event.pattern_name == variant_event.pattern_name
+    assert base_event.bias == variant_event.bias
+    assert base_event.context_quality == variant_event.context_quality
 
 
 def make_double_top_df(

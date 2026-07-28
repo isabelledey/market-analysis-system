@@ -175,7 +175,7 @@ def test_incomplete_candle_is_excluded_from_trend_reversal() -> None:
     assert result["latest_datetime"] == pd.Timestamp(df.iloc[-2]["Datetime"]).isoformat(timespec="minutes")
 
 
-def test_breakdown_support_appears_in_trend_evidence() -> None:
+def test_stale_breakdown_support_decays_out_of_trend_evidence() -> None:
     closes = [110 - (index * 0.02) for index in range(35)]
     df = make_ohlcv_df(closes)
     df.loc[20:24, "Close"] = [109.7, 109.68, 109.66, 109.64, 109.62]
@@ -195,6 +195,20 @@ def test_breakdown_support_appears_in_trend_evidence() -> None:
         ]
 
     result = analyze_dataframe(df=df, symbol="BD", as_of=analysis_as_of(df))
+
+    assert result["trend"] == "Downtrend"
+    assert not any("downside break" in item.lower() for item in result["trend_evidence"])
+
+
+def test_recent_breakdown_support_appears_in_trend_evidence() -> None:
+    closes = [110 - (index * 0.02) for index in range(30)]
+    df = make_ohlcv_df(closes)
+    df.loc[20:24, "Close"] = [109.7, 109.68, 109.66, 109.64, 109.62]
+    df.loc[25, ["Open", "High", "Low", "Close", "Volume"]] = [109.65, 109.7, 107.8, 107.9, 5000]
+    df.loc[26, ["Open", "High", "Low", "Close", "Volume"]] = [107.95, 108.05, 107.4, 107.5, 4200]
+    df.loc[27, ["Open", "High", "Low", "Close", "Volume"]] = [107.55, 107.6, 107.0, 107.1, 3500]
+
+    result = analyze_dataframe(df=df, symbol="BDNEW", as_of=analysis_as_of(df))
 
     assert result["trend"] == "Downtrend"
     assert any("downside break" in item.lower() for item in result["trend_evidence"])
@@ -224,9 +238,14 @@ def test_overlapping_pin_bar_and_doji_are_grouped_as_one_evidence_event() -> Non
         if pattern["candles_ago"] == 0
     ]
 
-    assert {pattern["pattern_name"] for pattern in latest_bar_patterns} >= {"Bullish Pin Bar", "Doji"}
-    assert sum(1 for pattern in latest_bar_patterns if pattern["group_primary"]) == 1
-    assert sum(1 for pattern in latest_bar_patterns if pattern["group_suppressed"]) >= 1
+    assert {pattern["detector_label"] for pattern in latest_bar_patterns} >= {"Bullish Pin Bar", "Doji"}
+    assert sum(1 for pattern in latest_bar_patterns if pattern["group_primary"]) == 0
+    canonical_overlap = next(
+        event
+        for event in result["current_neutral_evidence"]
+        if event["matched_detector_labels"] == ["Bullish Pin Bar", "Doji"]
+    )
+    assert canonical_overlap["primary_pattern_name"] == "Lower-Wick Rejection"
 
 
 def test_trend_classifier_is_independent_from_pattern_scoring() -> None:

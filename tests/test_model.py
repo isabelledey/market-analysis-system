@@ -192,4 +192,5 @@ def test_all_patterns_are_returned_while_top_patterns_remain_limited() -> None:
 
     assert len(result["all_detected_patterns"]) == 4
     assert len(result["top_patterns"]) == 3
-    assert result["top_patterns"][0]["pattern_name"] == "Bullish Pin Bar"
+    assert result["top_patterns"][0]["pattern_name"] == "Lower-Wick Rejection"
+    assert result["top_patterns"][0]["detector_label"] == "Bullish Pin Bar"

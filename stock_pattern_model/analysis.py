@@ -38,6 +38,7 @@ from stock_pattern_model.scoring import build_evidence_group
 from stock_pattern_model.scoring import build_event_id
 from stock_pattern_model.scoring import build_setup_id
 from stock_pattern_model.scoring import pattern_max_age_bars
+from stock_pattern_model.scoring import resolved_pattern_sort_key
 from stock_pattern_model.scoring import ScoringService
 from stock_pattern_model.session_utils import DEFAULT_REGULAR_SESSION_END
 from stock_pattern_model.session_utils import DEFAULT_REGULAR_SESSION_START
@@ -202,6 +203,7 @@ def _prepare_pattern_records(
                 "bias": event.bias,
                 "status": event.status.value,
                 "pattern_family": event.pattern_family.value,
+                "detector_label": str(metadata.get("label", event.pattern_name)),
                 "priority": int(metadata.get("priority", 99)),
                 "base_score": float(event.base_score),
                 "weighted_score": weighted_score,
@@ -225,12 +227,16 @@ def _prepare_pattern_records(
                         "unconfirmed structural pattern"
                         if event.status is PatternStatus.TENTATIVE
                         else (
+                            "unconfirmed candidate geometry"
+                            if event.status is PatternStatus.CANDIDATE
+                            else (
                             "failed pattern"
                             if event.status is PatternStatus.FAILED
                             else (
                                 "expired"
                                 if event.status is PatternStatus.EXPIRED
                                 else None
+                            )
                             )
                         )
                     )
@@ -412,17 +418,7 @@ def _expiration_transition_index(
 
 
 def _select_group_primary(group_patterns: list[dict[str, Any]]) -> dict[str, Any]:
-    ranked = sorted(
-        group_patterns,
-        key=lambda item: (
-            item["status"] != "confirmed",
-            item["bias"] == "Neutral",
-            -abs(float(item["base_score"])),
-            int(item["priority"]),
-            int(item["candles_ago"]),
-            item["pattern_name"],
-        ),
-    )
+    ranked = sorted(group_patterns, key=resolved_pattern_sort_key)
     return ranked[0]
 
 
@@ -902,6 +898,7 @@ def _build_canonical_event_groups(
     interval: str,
     df: pd.DataFrame,
     pattern_config: PatternConfig,
+    scoring_config: ScoringConfig,
 ) -> list[dict[str, Any]]:
     grouped: dict[str, list[dict[str, Any]]] = {}
     for pattern in patterns:
@@ -913,8 +910,17 @@ def _build_canonical_event_groups(
         event = primary["event"]
         labels = list(
             dict.fromkeys(
-                pattern["pattern_name"]
-                for pattern in sorted(group_patterns, key=lambda item: item["pattern_name"])
+                str(pattern.get("detector_label") or pattern["pattern_name"])
+                for pattern in sorted(
+                    group_patterns,
+                    key=lambda item: str(item.get("detector_label") or item["pattern_name"]),
+                )
+            )
+        )
+        raw_geometry_labels = list(
+            dict.fromkeys(
+                event.geometry_label
+                for event in (pattern["event"] for pattern in group_patterns)
             )
         )
         primary_completion = pd.Timestamp(event.pattern_end_at)
@@ -928,8 +934,10 @@ def _build_canonical_event_groups(
         expired_at = primary.get("expired_at")
         inclusion_reason = _current_score_exclusion_reason(primary)
         included_in_current_score = inclusion_reason is None and bool(primary.get("group_primary", False))
-        current_weighted_score = (
-            round(float(primary.get("pattern_score_contribution", 0.0)) + float(primary.get("volume_score_contribution", 0.0)), 2)
+        pattern_score_contribution = round(float(primary.get("pattern_score_contribution", 0.0)), 2)
+        volume_score_contribution = round(float(primary.get("volume_score_contribution", 0.0)), 2)
+        combined_event_contribution = (
+            round(pattern_score_contribution + volume_score_contribution, 2)
             if included_in_current_score
             else 0.0
         )
@@ -939,13 +947,27 @@ def _build_canonical_event_groups(
             config=pattern_config,
         )
         overlap_label_count = max(0, len(labels) - 1)
+        state_reference_index = primary.get("state_reference_index")
+        state_age_bars = (
+            max(0, int(primary["last_completed_candle_index"]) - int(state_reference_index))
+            if state_reference_index is not None
+            else int(primary.get("score_anchor_candles_ago", primary["candles_ago"]))
+        )
         canonical_events.append(
             {
                 "event_id": f"canonical:{primary['evidence_group']}",
+                "resolved_pattern_name": primary["pattern_name"],
+                "resolved_bias": primary["bias"],
+                "resolved_status": primary["status"],
+                "resolved_context_quality": event.context_quality,
+                "resolved_context": event.context_bias,
                 "primary_pattern_name": primary["pattern_name"],
                 "pattern_labels": labels,
+                "matched_detector_labels": labels,
+                "raw_geometry_labels": raw_geometry_labels,
                 "family": primary["pattern_family"],
                 "bias": primary["bias"],
+                "status": primary["status"],
                 "pattern_start": format_iso_timestamp(event.pattern_start_at),
                 "setup_completion": format_iso_timestamp(event.setup_completion_at or event.pattern_end_at),
                 "pattern_completion": format_iso_timestamp(primary_completion),
@@ -957,6 +979,11 @@ def _build_canonical_event_groups(
                 ),
                 "completion_index": int(primary["pattern_completion_index"]),
                 "last_completed_candle_index": int(primary["last_completed_candle_index"]),
+                "state_reference_index": int(state_reference_index) if state_reference_index is not None else None,
+                "state_age_bars": state_age_bars,
+                "score_age_bars": int(primary.get("score_anchor_candles_ago", primary["candles_ago"])),
+                "score_max_age_bars": int(primary.get("score_max_age_bars", scoring_config.pattern_max_age_bars)),
+                "state_expiration_bars": int(scoring_config.state_expiration_bars),
                 "state": primary["event_state"],
                 "state_updated_at": format_iso_timestamp(state_updated_at) if state_updated_at is not None else None,
                 "retest_at": format_iso_timestamp(retest_at) if retest_at is not None else None,
@@ -967,10 +994,20 @@ def _build_canonical_event_groups(
                 "expired_at": format_iso_timestamp(expired_at) if expired_at is not None else None,
                 "signal_strength": float(primary["signal_strength"]),
                 "raw_score": float(primary["base_score"]),
-                "current_weighted_score": current_weighted_score,
+                "pattern_score_contribution": pattern_score_contribution,
+                "volume_score_contribution": volume_score_contribution,
+                "combined_event_contribution": combined_event_contribution,
+                "current_weighted_score": combined_event_contribution,
+                "recency_weight": round(float(primary.get("recency_weight", 0.0)), 4),
                 "evidence_group": primary["evidence_group"],
                 "included_in_current_score": included_in_current_score,
+                "score_eligible": bool(primary.get("score_eligible", False)),
                 "exclusion_reason": inclusion_reason,
+                "geometry_label": event.geometry_label,
+                "context_tags": list(event.context_tags),
+                "context_bias": event.context_bias,
+                "context_quality": event.context_quality,
+                "detector_version": event.detector_version,
                 "exchange_timezone": primary["exchange_timezone"],
                 "display_timezone": str(display_timezone),
                 "pattern_start_display": format_display_datetime(event.pattern_start_at, display_timezone),
@@ -1083,38 +1120,137 @@ def _canonical_display_timestamp(event: dict[str, Any], *field_names: str) -> pd
 def _build_session_context(
     canonical_events: list[dict[str, Any]],
     session_date: str,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+) -> list[dict[str, Any]]:
     session_history = [event for event in canonical_events if event["session_date"] == session_date]
-    current_relevant = [
+    return session_history
+
+
+def _current_display_sort_key(event: dict[str, Any]) -> tuple[object, ...]:
+    return (
+        -_canonical_display_timestamp(
+            event,
+            "state_updated_at",
+            "reclaimed_at",
+            "rejection_at",
+            "retest_at",
+            "confirmation_at",
+            "detected_at",
+        ).value,
+        event["primary_pattern_name"],
+    )
+
+
+def _is_current_display_relevant(event: dict[str, Any]) -> bool:
+    state = str(event["state"])
+    if state in {"expired", "invalidated", "failed", "failed_breakout", "failed_breakdown"}:
+        return False
+    if event["included_in_current_score"]:
+        return event["score_age_bars"] <= event["score_max_age_bars"]
+    return event["state_age_bars"] <= max(1, event["state_expiration_bars"])
+
+
+def _build_evidence_collections(
+    canonical_events: list[dict[str, Any]],
+    *,
+    overall_bias: str,
+    session_date: str,
+) -> dict[str, list[dict[str, Any]]]:
+    contributing_directional = [
         event
         for event in canonical_events
-        if event["state"] in {"new", "active", "retested", "retest_pending", "retest_rejected", "reclaimed", "awaiting_confirmation"}
+        if event["included_in_current_score"]
+        and abs(float(event["combined_event_contribution"])) > 0
+        and event["bias"] in {"Bullish", "Bearish"}
+        and event["score_eligible"]
+        and _is_current_display_relevant(event)
     ]
-    current_relevant = sorted(
-        current_relevant,
-        key=lambda event: (
-            -_canonical_display_timestamp(
-                event,
-                "state_updated_at",
-                "reclaimed_at",
-                "rejection_at",
-                "retest_at",
-                "confirmation_at",
-                "detected_at",
-            ).value,
-            event["primary_pattern_name"],
-        ),
+    has_bullish_conflict = any(event["bias"] == "Bullish" for event in contributing_directional)
+    has_bearish_conflict = any(event["bias"] == "Bearish" for event in contributing_directional)
+    conflicting_event_ids = (
+        {event["event_id"] for event in contributing_directional}
+        if has_bullish_conflict and has_bearish_conflict
+        else set()
     )
-    return current_relevant, session_history
+
+    categories: dict[str, list[dict[str, Any]]] = {
+        "current_contributing_evidence": [],
+        "awaiting_confirmation_evidence": [],
+        "current_conflicting_evidence": [],
+        "current_neutral_evidence": [],
+        "recent_non_contributing_tracked_events": [],
+        "historical_lifecycle_events": [],
+    }
+    category_by_event_id: dict[str, str] = {}
+
+    for event in sorted(canonical_events, key=_current_display_sort_key):
+        if not _is_current_display_relevant(event):
+            category = "historical_lifecycle_events"
+        elif event["event_id"] in conflicting_event_ids:
+            category = "current_conflicting_evidence"
+        elif (
+            event["included_in_current_score"]
+            and abs(float(event["combined_event_contribution"])) > 0
+            and event["score_eligible"]
+        ):
+            category = "current_contributing_evidence"
+        elif event["state"] == "awaiting_confirmation":
+            category = "awaiting_confirmation_evidence"
+        elif (
+            event["bias"] == "Neutral"
+            or event.get("context_quality") == "geometry_only"
+            or event.get("status") == "candidate"
+        ):
+            category = "current_neutral_evidence"
+        elif event["state"] in {"new", "active", "retested", "retest_pending", "retest_rejected", "reclaimed"}:
+            category = "recent_non_contributing_tracked_events"
+        else:
+            category = "historical_lifecycle_events"
+
+        categories[category].append(dict(event, current_display_category=category))
+        category_by_event_id[event["event_id"]] = category
+
+    historical_lifecycle = categories["historical_lifecycle_events"]
+    relevant_session_detections = [event for event in canonical_events if event["session_date"] == session_date]
+    return {
+        **categories,
+        "relevant_session_detections": relevant_session_detections,
+        "conflict_event_ids": sorted(conflicting_event_ids),
+        "conflict_count": len(conflicting_event_ids),
+        "current_relevant_patterns": sorted(
+            (
+                categories["current_contributing_evidence"]
+                + categories["awaiting_confirmation_evidence"]
+                + categories["current_conflicting_evidence"]
+                + categories["current_neutral_evidence"]
+                + categories["recent_non_contributing_tracked_events"]
+            ),
+            key=_current_display_sort_key,
+        ),
+        "current_relevant_patterns_deprecated": True,
+        "historical_lifecycle_summary": {
+            "count": len(historical_lifecycle),
+            "by_state": {
+                state: sum(1 for event in historical_lifecycle if event["state"] == state)
+                for state in sorted({event["state"] for event in historical_lifecycle})
+            },
+            "by_family": {
+                family: sum(1 for event in historical_lifecycle if event["family"] == family)
+                for family in sorted({event["family"] for event in historical_lifecycle})
+            },
+        },
+        "event_category_by_id": category_by_event_id,
+        "overall_bias": overall_bias,
+    }
 
 
 def _build_explanation_sections(
     structured_explanation: dict[str, Any],
     *,
-    current_relevant_patterns: list[dict[str, Any]],
+    evidence_collections: dict[str, Any],
     session_pattern_history: list[dict[str, Any]],
     latest_canonical_labels: list[str],
 ) -> dict[str, Any]:
+    current_relevant_patterns = list(evidence_collections.get("current_relevant_patterns", []))
     current_pattern_lines: list[str] = []
     for event in current_relevant_patterns[:5]:
         line = (
@@ -1158,10 +1294,29 @@ def _build_explanation_sections(
         lifecycle_note = "Only completed candles were allowed to change lifecycle states."
     lifecycle_note += " The current incomplete candle was excluded from lifecycle transitions."
 
+    conflicts = []
+    if evidence_collections.get("current_conflicting_evidence"):
+        conflicts.append(
+            f"{len(evidence_collections['current_conflicting_evidence'])} current score-contributing event(s) conflict directionally."
+        )
+    conflict_count = int(evidence_collections.get("conflict_count", 0))
+    if conflict_count and conflict_count != len(evidence_collections.get("current_conflicting_evidence", [])):
+        conflicts.append(
+            f"Conflict accounting identified {conflict_count} conflicting canonical event(s)."
+        )
+
     enriched = dict(structured_explanation)
     enriched["current_pattern_evidence"] = current_pattern_lines
     enriched["session_context"] = session_context_lines
     enriched["lifecycle_note"] = lifecycle_note
+    enriched["conflicts"] = conflicts + list(structured_explanation.get("conflicts", []))
+    enriched["current_display_summary"] = {
+        "current_contributing_count": len(evidence_collections.get("current_contributing_evidence", [])),
+        "awaiting_confirmation_count": len(evidence_collections.get("awaiting_confirmation_evidence", [])),
+        "current_conflicting_count": len(evidence_collections.get("current_conflicting_evidence", [])),
+        "current_neutral_count": len(evidence_collections.get("current_neutral_evidence", [])),
+        "recent_non_contributing_count": len(evidence_collections.get("recent_non_contributing_tracked_events", [])),
+    }
     return enriched
 
 
@@ -1259,10 +1414,17 @@ def _serialize_pattern_event(
         "weighted_score": pattern["weighted_score"],
         "pattern_score_contribution": pattern["pattern_score_contribution"],
         "volume_score_contribution": pattern["volume_score_contribution"],
+        "combined_score_contribution": pattern.get("combined_score_contribution", 0.0),
         "detection_reason": pattern["detection_reason"],
         "signal_strength": pattern["signal_strength"],
         "strength_label": pattern["strength_label"],
         "volume_baseline_source": pattern["volume_baseline_source"],
+        "detector_label": pattern.get("detector_label", event.pattern_name),
+        "geometry_label": event.geometry_label,
+        "context_tags": list(event.context_tags),
+        "context_bias": event.context_bias,
+        "context_quality": event.context_quality,
+        "detector_version": event.detector_version,
         "score_anchor_type": pattern.get("score_anchor_type"),
         "score_anchor_index": pattern.get("score_anchor_index"),
         "score_anchor_candles_ago": pattern.get("score_anchor_candles_ago"),
@@ -1567,6 +1729,7 @@ def analyze_dataframe(
     trend = str(latest_row["Trend"])
     trend_structure_score = round(float(latest_row.get("Trend_Score", 0.0)), 2)
     trend_evidence = list(latest_row.get("Trend_Evidence", []))
+    trend_evidence_structured = list(latest_row.get("Trend_Evidence_Structured", []))
     trend_horizon = str(latest_row.get("Trend_Horizon", "Short-to-medium term"))
     session_info = _latest_completed_session_info(pattern_df, interval, context=context)
     resolved_events, ignored_patterns_count = resolve_pattern_conflicts(raw_events)
@@ -1602,6 +1765,7 @@ def analyze_dataframe(
         trend=trend,
         trend_structure_score=trend_structure_score,
         trend_evidence=trend_evidence,
+        trend_evidence_structured=trend_evidence_structured,
         trend_horizon=trend_horizon,
         display_timezone=str(display_zone),
         patterns=prepared_patterns,
@@ -1624,15 +1788,22 @@ def analyze_dataframe(
         interval=interval,
         df=pattern_df,
         pattern_config=config.pattern,
+        scoring_config=config.scoring,
     )
-    current_relevant_patterns, session_pattern_history = _build_session_context(
+    session_pattern_history = _build_session_context(
         canonical_events,
         session_info["session_date"],
     )
+    evidence_collections = _build_evidence_collections(
+        canonical_events,
+        overall_bias=overall_bias,
+        session_date=session_info["session_date"],
+    )
+    current_relevant_patterns = evidence_collections["current_relevant_patterns"]
     latest_canonical_labels = current_relevant_patterns[0]["pattern_labels"] if current_relevant_patterns else []
     structured_explanation = _build_explanation_sections(
         scoring_result["structured_explanation"],
-        current_relevant_patterns=current_relevant_patterns,
+        evidence_collections=evidence_collections,
         session_pattern_history=session_pattern_history,
         latest_canonical_labels=latest_canonical_labels,
     )
@@ -1713,8 +1884,11 @@ def analyze_dataframe(
         "medium_term_trend_score": round(float(latest_row.get("Medium_Term_Trend_Score", trend_structure_score)), 2),
         "long_term_trend_score": round(float(latest_row.get("Long_Term_Trend_Score", trend_structure_score)), 2),
         "trend_evidence": trend_evidence,
+        "trend_evidence_structured": trend_evidence_structured,
         "pattern_score": score["pattern_score"],
         "volume_score": score["volume_score"],
+        "bullish_pattern_score": score["bullish_pattern_score"],
+        "bearish_pattern_score": score["bearish_pattern_score"],
         "bullish_score": score["bullish_score"],
         "bearish_score": score["bearish_score"],
         "net_signal_score": score["net_signal_score"],
@@ -1725,7 +1899,9 @@ def analyze_dataframe(
         "top_patterns": top_patterns,
         "all_detected_patterns": all_detected_patterns,
         "current_relevant_patterns": current_relevant_patterns,
+        "current_relevant_patterns_deprecated": evidence_collections["current_relevant_patterns_deprecated"],
         "session_pattern_history": session_pattern_history,
+        **evidence_collections,
         "session_history_total": len(session_pattern_history),
         "session_history_shown": len(session_pattern_history),
         "relevant_session": {

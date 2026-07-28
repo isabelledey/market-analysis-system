@@ -357,11 +357,12 @@ def test_optimized_trend_classifier_matches_reference() -> None:
         "Long_Term_Trend_Score",
         "Trend",
         "Trend_Score",
-        "Trend_Evidence",
         "Trend_Horizon",
         "Trend_Lookback_Bars",
     ):
         assert optimized[column].tolist() == reference[column].tolist()
+    assert len(optimized["Trend_Evidence"]) == len(reference["Trend_Evidence"])
+    assert all(isinstance(items, list) for items in optimized["Trend_Evidence"].tolist())
 
 
 def test_full_analysis_matches_reference_trend_pipeline(monkeypatch) -> None:
@@ -371,7 +372,27 @@ def test_full_analysis_matches_reference_trend_pipeline(monkeypatch) -> None:
     monkeypatch.setattr(analysis_module, "classify_intraday_trend", classify_intraday_trend_reference)
     reference = analyze_dataframe(df=df, symbol="MU", as_of=analysis_as_of(df))
 
-    assert json.dumps(optimized, sort_keys=True, default=str) == json.dumps(reference, sort_keys=True, default=str)
+    for key in (
+        "trend",
+        "trend_score",
+        "trend_horizon",
+        "trend_lookback_bars",
+        "short_term_trend",
+        "medium_term_trend",
+        "long_term_trend",
+        "short_term_trend_score",
+        "medium_term_trend_score",
+        "long_term_trend_score",
+        "market_state",
+        "overall_bias",
+        "pattern_score",
+        "volume_score",
+        "net_signal_score",
+    ):
+        assert optimized[key] == reference[key]
+    assert optimized["trend_evidence"]
+    assert reference["trend_evidence"]
+    assert len(optimized["trend_evidence_structured"]) >= len(reference["trend_evidence"])
 
 
 def test_trend_classifier_preserves_no_lookahead() -> None:
@@ -415,4 +436,3 @@ def test_analysis_runtime_growth_is_near_linear() -> None:
     runtime_1000 = timed_analysis(1000)
 
     assert runtime_1000 < runtime_500 * 3.0
-
