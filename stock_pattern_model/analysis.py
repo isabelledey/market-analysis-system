@@ -2,48 +2,64 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 from typing import Any
-from typing import Optional
 
 import pandas as pd
 
-from stock_pattern_model.config import AnalysisConfig
-from stock_pattern_model.config import MarketDataConfig
-from stock_pattern_model.config import PatternConfig
-from stock_pattern_model.config import ScoringConfig
-from stock_pattern_model.context import AnalysisContext
-from stock_pattern_model.context import build_analysis_context
-from stock_pattern_model.context import dataframe_identity
-from stock_pattern_model.datetime_utils import convert_to_timezone
-from stock_pattern_model.datetime_utils import format_display_datetime
-from stock_pattern_model.datetime_utils import format_iso_timestamp
-from stock_pattern_model.domain import DataQualityReport
-from stock_pattern_model.domain import PatternEvent
-from stock_pattern_model.domain import PatternStatus
-from stock_pattern_model.domain import ResolvedInstrument
-from stock_pattern_model.exceptions import DataValidationError
-from stock_pattern_model.exceptions import NoCompletedBarsError
+from stock_pattern_model.config import (
+    AnalysisConfig,
+    MarketDataConfig,
+    PatternConfig,
+    ScoringConfig,
+)
+from stock_pattern_model.context import (
+    AnalysisContext,
+    build_analysis_context,
+    dataframe_identity,
+)
+from stock_pattern_model.datetime_utils import (
+    convert_to_timezone,
+    format_display_datetime,
+    format_iso_timestamp,
+)
+from stock_pattern_model.domain import (
+    DataQualityReport,
+    PatternEvent,
+    PatternStatus,
+    ResolvedInstrument,
+)
+from stock_pattern_model.exceptions import DataValidationError, NoCompletedBarsError
 from stock_pattern_model.features import add_features
-from stock_pattern_model.market_data import FileDataProvider
-from stock_pattern_model.market_data import MarketDataProvider
-from stock_pattern_model.market_data import YFinanceProvider
-from stock_pattern_model.market_data import validate_market_data
-from stock_pattern_model.pattern_detector import DEFAULT_PATTERN_REGISTRY
-from stock_pattern_model.pattern_detector import PatternRegistry
-from stock_pattern_model.pattern_detector import classify_intraday_trend
-from stock_pattern_model.pattern_detector import detect_patterns
-from stock_pattern_model.pattern_detector import resolve_pattern_conflicts
-from stock_pattern_model.scoring import build_evidence_group
-from stock_pattern_model.scoring import build_event_id
-from stock_pattern_model.scoring import build_setup_id
-from stock_pattern_model.scoring import pattern_max_age_bars
-from stock_pattern_model.scoring import resolved_pattern_sort_key
-from stock_pattern_model.scoring import ScoringService
-from stock_pattern_model.session_utils import DEFAULT_REGULAR_SESSION_END
-from stock_pattern_model.session_utils import DEFAULT_REGULAR_SESSION_START
-from stock_pattern_model.session_utils import DEFAULT_SESSION_MODE
-from stock_pattern_model.session_utils import session_date_series
+from stock_pattern_model.market_data import (
+    FileDataProvider,
+    MarketDataProvider,
+    YFinanceProvider,
+    validate_market_data,
+)
+from stock_pattern_model.pattern_detector import (
+    DEFAULT_PATTERN_REGISTRY,
+    PatternRegistry,
+    classify_intraday_trend,
+    classify_local_session_trend,
+    deduplicate_structural_events,
+    detect_patterns,
+    resolve_pattern_conflicts,
+)
+from stock_pattern_model.scoring import (
+    ScoringService,
+    analytical_family,
+    build_event_id,
+    build_evidence_group,
+    build_setup_id,
+    pattern_max_age_bars,
+    resolved_pattern_sort_key,
+)
+from stock_pattern_model.session_utils import (
+    DEFAULT_REGULAR_SESSION_END,
+    DEFAULT_REGULAR_SESSION_START,
+    DEFAULT_SESSION_MODE,
+    session_date_series,
+)
 
 
 def _get_recency_weight(candles_ago: int) -> float:
@@ -65,7 +81,7 @@ def _get_bar_end(timestamp: pd.Timestamp, interval: str) -> pd.Timestamp:
     return timestamp + _get_bar_timedelta(interval)
 
 
-def _normalize_as_of(as_of: Optional[pd.Timestamp]) -> pd.Timestamp:
+def _normalize_as_of(as_of: pd.Timestamp | None) -> pd.Timestamp:
     if as_of is None:
         return pd.Timestamp.now(tz="UTC")
 
@@ -105,7 +121,7 @@ def _update_completed_row_count(
 def _filter_completed_candles(
     df: pd.DataFrame,
     interval: str,
-    as_of: Optional[pd.Timestamp],
+    as_of: pd.Timestamp | None,
     quality_report: DataQualityReport,
 ) -> tuple[pd.DataFrame, pd.Timestamp, DataQualityReport]:
     normalized_as_of = _normalize_as_of(as_of)
@@ -145,6 +161,12 @@ def _run_pattern_pipeline(
         pivot_left_bars=config.pattern.pivot_left_bars,
         pivot_right_bars=config.pattern.pivot_right_bars,
         breakout_lookback=config.pattern.breakout_lookback,
+    )
+    pattern_df = classify_local_session_trend(
+        pattern_df,
+        lookback_bars=config.pattern.local_trend_lookback_bars,
+        pivot_left_bars=config.pattern.pivot_left_bars,
+        pivot_right_bars=config.pattern.pivot_right_bars,
     )
     pattern_events = detect_patterns(pattern_df, config.pattern, config.interval, registry=registry)
     return pattern_df, pattern_events
@@ -245,7 +267,17 @@ def _prepare_pattern_records(
                 or (
                     score_tentative_patterns
                     and event.status is PatternStatus.TENTATIVE
-                ),
+                )
+                # A dampener-eligible TENTATIVE rejection (Stage 4) is a coarse "plausibly
+                # scoreable" candidate regardless of `score_tentative_patterns`; the precise
+                # eligibility (pending dampener vs. directionally confirmed vs. invalidated) is
+                # decided later by ScoringService.evaluate_pattern_eligibility using event_state.
+                or bool(event.dampener_eligible),
+                "pattern_entry_trend": event.pattern_entry_trend,
+                "pattern_entry_trend_score": float(event.pattern_entry_trend_score),
+                "pattern_entry_trend_lookback_bars": int(event.pattern_entry_trend_lookback_bars),
+                "rejection_confirmation_state": event.rejection_confirmation_state,
+                "dampener_eligible": bool(event.dampener_eligible),
             }
         )
 
@@ -334,7 +366,7 @@ def _price_tolerance(
 
 
 def _family_supports_retest(pattern: dict[str, Any]) -> bool:
-    return pattern["pattern_id"] in {"breakout", "breakdown", "bullish_pin_bar", "shooting_star"}
+    return pattern["pattern_id"] in {"breakout", "breakdown", "bullish_pin_bar", "shooting_star", "hammer"}
 
 
 def _pattern_extreme(df: pd.DataFrame, pattern: dict[str, Any], direction: str) -> float:
@@ -360,7 +392,7 @@ def _is_retest_candle(
         level = float(relevant_prices.get("breakdown_level") or relevant_prices.get("confirmation_price") or row["Close"])
         tolerance = _price_tolerance(df, completion_index, level, config)
         return bool(float(row["High"]) >= level - tolerance and float(row["Close"]) <= level)
-    if pattern["pattern_id"] == "bullish_pin_bar":
+    if pattern["pattern_id"] in {"bullish_pin_bar", "hammer"}:
         low = float(relevant_prices["low"])
         high = float(relevant_prices["high"])
         zone_high = low + ((high - low) * 0.35)
@@ -370,6 +402,31 @@ def _is_retest_candle(
         low = float(relevant_prices["low"])
         zone_low = high - ((high - low) * 0.35)
         return bool(float(row["High"]) >= zone_low and float(row["Close"]) < zone_low)
+    return False
+
+
+def _is_directionally_confirmed_candle(
+    pattern: dict[str, Any],
+    row: pd.Series,
+    df: pd.DataFrame,
+    config: PatternConfig,
+) -> bool:
+    """A later close beyond the rejection candle's own extreme directionally confirms a lower-
+    wick rejection (Hammer / Bullish Pin Bar, close above the high) or an upper-wick rejection
+    (Shooting Star / bearish continuation rejection, close below the low). Before this, the
+    pattern stays a bounded, unconfirmed signal (see `dampener_eligible` in scoring.py); this is
+    what promotes it. Merely failing to invalidate (Stage 5) is not, by itself, confirmation.
+    """
+    relevant_prices = pattern["event"].relevant_prices
+    completion_index = _completion_reference_index(pattern)
+    if pattern["pattern_id"] in {"hammer", "bullish_pin_bar"}:
+        high = float(relevant_prices["high"])
+        tolerance = _price_tolerance(df, completion_index, high, config)
+        return bool(float(row["Close"]) > high + tolerance)
+    if pattern["pattern_id"] == "shooting_star":
+        low = float(relevant_prices["low"])
+        tolerance = _price_tolerance(df, completion_index, low, config)
+        return bool(float(row["Close"]) < low - tolerance)
     return False
 
 
@@ -585,11 +642,15 @@ def _apply_generic_pattern_lifecycle(
     completion_index = _completion_reference_index(pattern)
     retest_index: int | None = None
     invalidation_index: int | None = None
+    confirmation_index: int | None = None
 
     for scan_index in range(completion_index + 1, len(df)):
         row = df.iloc[scan_index]
         if _is_invalidated_candle(pattern, row, df, config):
             invalidation_index = scan_index
+            break
+        if _is_directionally_confirmed_candle(pattern, row, df, config):
+            confirmation_index = scan_index
             break
         if retest_index is None and _family_supports_retest(pattern) and _is_retest_candle(pattern, row, df, config):
             retest_index = scan_index
@@ -597,6 +658,9 @@ def _apply_generic_pattern_lifecycle(
     if invalidation_index is not None:
         state = "invalidated"
         state_reference_index = invalidation_index
+    elif confirmation_index is not None:
+        state = "directionally_confirmed"
+        state_reference_index = confirmation_index
     else:
         retest_reference_index = retest_index if retest_index is not None else completion_index
         expiration_bars = pattern_max_age_bars(pattern, scoring_config)
@@ -630,12 +694,22 @@ def _apply_generic_pattern_lifecycle(
         "failed_index": None,
         "failed_at": None,
         "invalidated_at": _transition_timestamp(df, invalidation_index, interval),
+        "confirmation_index": confirmation_index,
+        "confirmed_at": (
+            _transition_timestamp(df, confirmation_index, interval)
+            if state == "directionally_confirmed"
+            else None
+        ),
         "expired_at": (
             _transition_timestamp(df, state_reference_index, interval)
             if state == "expired"
             else None
         ),
-        "lifecycle_note": None,
+        "lifecycle_note": (
+            "A later close above the rejection candle's high directionally confirmed the setup."
+            if state == "directionally_confirmed"
+            else None
+        ),
     }
 
 
@@ -664,7 +738,18 @@ def _apply_pattern_lifecycle(
                 scoring_config=scoring_config,
             )
         elif primary["pattern_id"] in {"double_top", "double_bottom"} and primary["status"] == "tentative":
-            state_reference_index = int(primary.get("setup_completion_index") or primary.get("detected_index") or _completion_reference_index(primary))
+            # detected_index (when the second pivot became confirmable, pivot_right_bars after
+            # its own candle) must anchor the state timestamp, not setup_completion_index (the
+            # pivot candle itself). Using setup_completion_index here made state_updated_at land
+            # before detected_at, which is incoherent: the state cannot have "changed" before the
+            # system was even able to recognize the pattern existed.
+            state_reference_index = (
+                int(primary["detected_index"])
+                if primary.get("detected_index") is not None
+                else int(primary.get("setup_completion_index"))
+                if primary.get("setup_completion_index") is not None
+                else _completion_reference_index(primary)
+            )
             expiration_bars = pattern_max_age_bars(primary, scoring_config)
             expiration_index = _expiration_transition_index(
                 last_completed_index,
@@ -776,8 +861,11 @@ def _apply_pattern_lifecycle(
             updated["failed_at"] = lifecycle["failed_at"] if family_state in {"failed", "failed_breakout", "failed_breakdown"} else None
             updated["invalidation_index"] = lifecycle.get("invalidation_index")
             updated["invalidated_at"] = lifecycle["invalidated_at"] if family_state == "invalidated" else None
+            updated["directional_confirmation_index"] = lifecycle.get("confirmation_index")
+            updated["confirmed_at"] = lifecycle.get("confirmed_at") if family_state == "directionally_confirmed" else None
             updated["expired_at"] = lifecycle["expired_at"] if family_state == "expired" else None
             updated["last_completed_candle_index"] = last_completed_index
+            updated["last_completed_candle_at"] = _transition_timestamp(df, last_completed_index, interval)
             updated["lifecycle_transition_timestamp"] = state_updated_at
             updated["lifecycle_note"] = lifecycle.get("lifecycle_note")
             lifecycle_patterns.append(updated)
@@ -840,6 +928,8 @@ def _current_score_exclusion_reason(pattern: dict[str, Any]) -> str | None:
         return "overlap duplicate"
     if pattern.get("dependency_suppressed"):
         return "linked confirmation duplicate"
+    if pattern.get("cluster_suppressed"):
+        return "clustered correlated evidence"
     if pattern["event_state"] == "invalidated":
         return "invalidated"
     if pattern["event_state"] == "expired":
@@ -996,10 +1086,19 @@ def _build_canonical_event_groups(
                 "raw_score": float(primary["base_score"]),
                 "pattern_score_contribution": pattern_score_contribution,
                 "volume_score_contribution": volume_score_contribution,
+                "raw_volume_score_contribution": (
+                    round(float(primary["raw_volume_score_contribution"]), 2)
+                    if primary.get("raw_volume_score_contribution") is not None
+                    else volume_score_contribution
+                ),
+                "volume_evidence_id": primary.get("volume_evidence_id"),
+                "volume_deduplication_reason": primary.get("volume_deduplication_reason"),
                 "combined_event_contribution": combined_event_contribution,
                 "current_weighted_score": combined_event_contribution,
                 "recency_weight": round(float(primary.get("recency_weight", 0.0)), 4),
                 "evidence_group": primary["evidence_group"],
+                "analytical_family": analytical_family(primary),
+                "analytical_dependency_group": f"{analytical_family(primary)}:{primary['bias']}",
                 "included_in_current_score": included_in_current_score,
                 "score_eligible": bool(primary.get("score_eligible", False)),
                 "exclusion_reason": inclusion_reason,
@@ -1008,6 +1107,31 @@ def _build_canonical_event_groups(
                 "context_bias": event.context_bias,
                 "context_quality": event.context_quality,
                 "detector_version": event.detector_version,
+                "pattern_entry_trend": event.pattern_entry_trend,
+                "pattern_entry_trend_score": float(event.pattern_entry_trend_score),
+                "pattern_entry_trend_lookback_bars": int(event.pattern_entry_trend_lookback_bars),
+                "cluster_suppressed": bool(primary.get("cluster_suppressed", False)),
+                "cluster_id": primary.get("cluster_id"),
+                "cluster_type": primary.get("cluster_type"),
+                "cluster_member_ids": primary.get("cluster_member_ids") or [],
+                "cluster_size": primary.get("cluster_size", 1),
+                "cluster_price_zone": primary.get("cluster_price_zone"),
+                "cluster_strongest_score": primary.get("cluster_strongest_score"),
+                "cluster_repetition_bonus": primary.get("cluster_repetition_bonus"),
+                "cluster_penalties_applied": primary.get("cluster_penalties_applied") or [],
+                "cluster_bounded_contribution": primary.get("cluster_bounded_contribution"),
+                "raw_pattern_score_contribution": primary.get("raw_pattern_score_contribution"),
+                "rejection_confirmation_state": event.rejection_confirmation_state,
+                "dampener_eligible": bool(event.dampener_eligible),
+                "confirmed_at": (
+                    format_iso_timestamp(primary["confirmed_at"])
+                    if primary.get("confirmed_at") is not None
+                    else None
+                ),
+                "geometry_status": primary.get("geometry_status", "Validated"),
+                "context_status": primary.get("context_status", "Not Applicable"),
+                "directional_confirmation": primary.get("directional_confirmation", "Not Required"),
+                "follow_through": primary.get("follow_through", "Not Applicable"),
                 "exchange_timezone": primary["exchange_timezone"],
                 "display_timezone": str(display_timezone),
                 "pattern_start_display": format_display_datetime(event.pattern_start_at, display_timezone),
@@ -1154,7 +1278,24 @@ def _build_evidence_collections(
     *,
     overall_bias: str,
     session_date: str,
-) -> dict[str, list[dict[str, Any]]]:
+) -> dict[str, Any]:
+    """Classify canonical events for display, keeping four distinct questions separate:
+
+    1. Score eligibility (`score_eligible`) -- could this event participate in scoring at all.
+    2. Inclusion in the current score (`included_in_current_score`) -- did it actually contribute
+       a nonzero amount to the score just now.
+    3. Direction relative to the final bias (`bias_aligned_evidence_count` /
+       per-event `bias_aligned_with_overall`) -- only meaningful once a directional bias exists.
+    4. Directional conflict between bullish and bearish evidence (`directional_conflict_present` /
+       `directionally_conflicting_scored_evidence`) -- whether opposing scored evidence exists.
+
+    Earlier, question 3/4 were conflated with question 2: any event on the "wrong" side of a
+    conflict was moved out of `current_contributing_evidence` entirely, which for a Neutral overall
+    bias (where *nothing* is bias-aligned) emptied that bucket even though every event was
+    genuinely `included_in_current_score`. `current_contributing_evidence` now means exactly
+    "score-eligible, included in the current score, nonzero contribution" -- full stop -- and
+    conflict/alignment are reported as separate, additive facts about that same set.
+    """
     contributing_directional = [
         event
         for event in canonical_events
@@ -1164,18 +1305,38 @@ def _build_evidence_collections(
         and event["score_eligible"]
         and _is_current_display_relevant(event)
     ]
-    has_bullish_conflict = any(event["bias"] == "Bullish" for event in contributing_directional)
-    has_bearish_conflict = any(event["bias"] == "Bearish" for event in contributing_directional)
-    conflicting_event_ids = (
-        {event["event_id"] for event in contributing_directional}
-        if has_bullish_conflict and has_bearish_conflict
-        else set()
+    score_contributing_bullish_count = sum(
+        1 for event in contributing_directional if event["bias"] == "Bullish"
     )
+    score_contributing_bearish_count = sum(
+        1 for event in contributing_directional if event["bias"] == "Bearish"
+    )
+    directional_conflict_present = (
+        score_contributing_bullish_count > 0 and score_contributing_bearish_count > 0
+    )
+    bias_aligned_evidence_count = (
+        sum(1 for event in contributing_directional if event["bias"] == overall_bias)
+        if overall_bias in {"Bullish", "Bearish"}
+        else None
+    )
+    if directional_conflict_present:
+        if overall_bias in {"Bullish", "Bearish"}:
+            # The bias that actually won is still bias-aligned and score-contributing; only the
+            # minority side that pushed the other way is flagged as directionally conflicting.
+            conflicting_event_ids = {
+                event["event_id"] for event in contributing_directional if event["bias"] != overall_bias
+            }
+        else:
+            # A Neutral overall bias has no aligned side at all, so every directional
+            # score-contributing event is part of the conflict -- but they remain
+            # score-contributing regardless; this only flags them as also being in conflict.
+            conflicting_event_ids = {event["event_id"] for event in contributing_directional}
+    else:
+        conflicting_event_ids = set()
 
     categories: dict[str, list[dict[str, Any]]] = {
         "current_contributing_evidence": [],
         "awaiting_confirmation_evidence": [],
-        "current_conflicting_evidence": [],
         "current_neutral_evidence": [],
         "recent_non_contributing_tracked_events": [],
         "historical_lifecycle_events": [],
@@ -1185,8 +1346,6 @@ def _build_evidence_collections(
     for event in sorted(canonical_events, key=_current_display_sort_key):
         if not _is_current_display_relevant(event):
             category = "historical_lifecycle_events"
-        elif event["event_id"] in conflicting_event_ids:
-            category = "current_conflicting_evidence"
         elif (
             event["included_in_current_score"]
             and abs(float(event["combined_event_contribution"])) > 0
@@ -1206,13 +1365,35 @@ def _build_evidence_collections(
         else:
             category = "historical_lifecycle_events"
 
-        categories[category].append(dict(event, current_display_category=category))
+        is_conflicted = event["event_id"] in conflicting_event_ids
+        bias_aligned_with_overall = (
+            (event["bias"] == overall_bias) if overall_bias in {"Bullish", "Bearish"} else None
+        )
+        categories[category].append(
+            dict(
+                event,
+                current_display_category=category,
+                directionally_conflicted=is_conflicted,
+                bias_aligned_with_overall=bias_aligned_with_overall,
+            )
+        )
         category_by_event_id[event["event_id"]] = category
+
+    # A view over current_contributing_evidence, not a separate partition: every event here
+    # also appears in current_contributing_evidence, tagged with directionally_conflicted=True.
+    directionally_conflicting_scored_evidence = [
+        event for event in categories["current_contributing_evidence"] if event["event_id"] in conflicting_event_ids
+    ]
 
     historical_lifecycle = categories["historical_lifecycle_events"]
     relevant_session_detections = [event for event in canonical_events if event["session_date"] == session_date]
     return {
         **categories,
+        "directionally_conflicting_scored_evidence": directionally_conflicting_scored_evidence,
+        "score_contributing_bullish_count": score_contributing_bullish_count,
+        "score_contributing_bearish_count": score_contributing_bearish_count,
+        "bias_aligned_evidence_count": bias_aligned_evidence_count,
+        "directional_conflict_present": directional_conflict_present,
         "relevant_session_detections": relevant_session_detections,
         "conflict_event_ids": sorted(conflicting_event_ids),
         "conflict_count": len(conflicting_event_ids),
@@ -1220,7 +1401,6 @@ def _build_evidence_collections(
             (
                 categories["current_contributing_evidence"]
                 + categories["awaiting_confirmation_evidence"]
-                + categories["current_conflicting_evidence"]
                 + categories["current_neutral_evidence"]
                 + categories["recent_non_contributing_tracked_events"]
             ),
@@ -1277,7 +1457,9 @@ def _build_explanation_sections(
     ]
     if state_counts:
         state_summary = ", ".join(f"{count} {state}" for state, count in sorted(state_counts.items()))
-        session_context_lines.append(f"Session lifecycle summary: {state_summary}.")
+        session_context_lines.append(
+            f"Total session lifecycle summary (including current events): {state_summary}."
+        )
     if current_relevant_patterns:
         latest_event = current_relevant_patterns[0]
         latest_labels = ", ".join(latest_event["pattern_labels"])
@@ -1294,13 +1476,17 @@ def _build_explanation_sections(
         lifecycle_note = "Only completed candles were allowed to change lifecycle states."
     lifecycle_note += " The current incomplete candle was excluded from lifecycle transitions."
 
+    conflicting_scored_evidence = evidence_collections.get("directionally_conflicting_scored_evidence") or []
     conflicts = []
-    if evidence_collections.get("current_conflicting_evidence"):
+    if evidence_collections.get("directional_conflict_present"):
+        bullish_count = evidence_collections.get("score_contributing_bullish_count", 0)
+        bearish_count = evidence_collections.get("score_contributing_bearish_count", 0)
         conflicts.append(
-            f"{len(evidence_collections['current_conflicting_evidence'])} current score-contributing event(s) conflict directionally."
+            f"Directional conflict present: {bullish_count} bullish and {bearish_count} bearish "
+            "score-contributing event(s) disagree on direction."
         )
     conflict_count = int(evidence_collections.get("conflict_count", 0))
-    if conflict_count and conflict_count != len(evidence_collections.get("current_conflicting_evidence", [])):
+    if conflict_count and conflict_count != len(conflicting_scored_evidence):
         conflicts.append(
             f"Conflict accounting identified {conflict_count} conflicting canonical event(s)."
         )
@@ -1312,8 +1498,12 @@ def _build_explanation_sections(
     enriched["conflicts"] = conflicts + list(structured_explanation.get("conflicts", []))
     enriched["current_display_summary"] = {
         "current_contributing_count": len(evidence_collections.get("current_contributing_evidence", [])),
+        "score_contributing_bullish_count": evidence_collections.get("score_contributing_bullish_count", 0),
+        "score_contributing_bearish_count": evidence_collections.get("score_contributing_bearish_count", 0),
+        "bias_aligned_evidence_count": evidence_collections.get("bias_aligned_evidence_count"),
+        "directional_conflict_present": evidence_collections.get("directional_conflict_present", False),
+        "directionally_conflicting_count": len(conflicting_scored_evidence),
         "awaiting_confirmation_count": len(evidence_collections.get("awaiting_confirmation_evidence", [])),
-        "current_conflicting_count": len(evidence_collections.get("current_conflicting_evidence", [])),
         "current_neutral_count": len(evidence_collections.get("current_neutral_evidence", [])),
         "recent_non_contributing_count": len(evidence_collections.get("recent_non_contributing_tracked_events", [])),
     }
@@ -1414,6 +1604,13 @@ def _serialize_pattern_event(
         "weighted_score": pattern["weighted_score"],
         "pattern_score_contribution": pattern["pattern_score_contribution"],
         "volume_score_contribution": pattern["volume_score_contribution"],
+        "raw_volume_score_contribution": (
+            pattern["raw_volume_score_contribution"]
+            if pattern.get("raw_volume_score_contribution") is not None
+            else pattern["volume_score_contribution"]
+        ),
+        "volume_evidence_id": pattern.get("volume_evidence_id"),
+        "volume_deduplication_reason": pattern.get("volume_deduplication_reason"),
         "combined_score_contribution": pattern.get("combined_score_contribution", 0.0),
         "detection_reason": pattern["detection_reason"],
         "signal_strength": pattern["signal_strength"],
@@ -1425,6 +1622,31 @@ def _serialize_pattern_event(
         "context_bias": event.context_bias,
         "context_quality": event.context_quality,
         "detector_version": event.detector_version,
+        "pattern_entry_trend": event.pattern_entry_trend,
+        "pattern_entry_trend_score": float(event.pattern_entry_trend_score),
+        "pattern_entry_trend_lookback_bars": int(event.pattern_entry_trend_lookback_bars),
+        "cluster_suppressed": bool(pattern.get("cluster_suppressed", False)),
+        "cluster_id": pattern.get("cluster_id"),
+        "cluster_type": pattern.get("cluster_type"),
+        "cluster_member_ids": pattern.get("cluster_member_ids") or [],
+        "cluster_size": pattern.get("cluster_size", 1),
+        "cluster_price_zone": pattern.get("cluster_price_zone"),
+        "cluster_strongest_score": pattern.get("cluster_strongest_score"),
+        "cluster_repetition_bonus": pattern.get("cluster_repetition_bonus"),
+        "cluster_penalties_applied": pattern.get("cluster_penalties_applied") or [],
+        "cluster_bounded_contribution": pattern.get("cluster_bounded_contribution"),
+        "raw_pattern_score_contribution": pattern.get("raw_pattern_score_contribution"),
+        "rejection_confirmation_state": event.rejection_confirmation_state,
+        "dampener_eligible": bool(event.dampener_eligible),
+        "confirmed_at": (
+            format_iso_timestamp(pattern["confirmed_at"])
+            if pattern.get("confirmed_at") is not None
+            else None
+        ),
+        "geometry_status": pattern.get("geometry_status", "Validated"),
+        "context_status": pattern.get("context_status", "Not Applicable"),
+        "directional_confirmation": pattern.get("directional_confirmation", "Not Required"),
+        "follow_through": pattern.get("follow_through", "Not Applicable"),
         "score_anchor_type": pattern.get("score_anchor_type"),
         "score_anchor_index": pattern.get("score_anchor_index"),
         "score_anchor_candles_ago": pattern.get("score_anchor_candles_ago"),
@@ -1629,11 +1851,11 @@ def analyze_dataframe(
     df: pd.DataFrame,
     symbol: str = "DATAFRAME",
     interval: str = "15m",
-    as_of: Optional[pd.Timestamp] = None,
+    as_of: pd.Timestamp | None = None,
     display_timezone: str = "Asia/Jerusalem",
     lookback_bars: int = 12,
     top_pattern_count: int = 3,
-    instrument: Optional[ResolvedInstrument] = None,
+    instrument: ResolvedInstrument | None = None,
     exchange_timezone: str | None = None,
     strict_data: bool = True,
     data_quality_report: DataQualityReport | None = None,
@@ -1731,8 +1953,19 @@ def analyze_dataframe(
     trend_evidence = list(latest_row.get("Trend_Evidence", []))
     trend_evidence_structured = list(latest_row.get("Trend_Evidence_Structured", []))
     trend_horizon = str(latest_row.get("Trend_Horizon", "Short-to-medium term"))
+    local_trend = str(latest_row.get("Local_Trend", "Neutral"))
+    local_trend_score = round(float(latest_row.get("Local_Trend_Score", 0.0)), 2)
+    local_trend_evidence = list(latest_row.get("Local_Trend_Evidence", []))
+    local_trend_lookback_bars = int(
+        latest_row.get("Local_Trend_Lookback_Bars", config.pattern.local_trend_lookback_bars)
+    )
     session_info = _latest_completed_session_info(pattern_df, interval, context=context)
     resolved_events, ignored_patterns_count = resolve_pattern_conflicts(raw_events)
+    resolved_events, duplicate_structural_count = deduplicate_structural_events(
+        resolved_events,
+        price_tolerance_ratio=config.pattern.structural_duplicate_price_tolerance,
+    )
+    ignored_patterns_count += duplicate_structural_count
     prepared_patterns = _prepare_pattern_records(
         pattern_df,
         resolved_events,
@@ -1767,6 +2000,8 @@ def analyze_dataframe(
         trend_evidence=trend_evidence,
         trend_evidence_structured=trend_evidence_structured,
         trend_horizon=trend_horizon,
+        local_trend=local_trend,
+        local_trend_score=local_trend_score,
         display_timezone=str(display_zone),
         patterns=prepared_patterns,
         quality_report=quality_report,
@@ -1877,6 +2112,12 @@ def analyze_dataframe(
         "trend_signal_score": score["trend_score"],
         "trend_horizon": trend_horizon,
         "trend_lookback_bars": int(latest_row.get("Trend_Lookback_Bars", config.scoring.lookback_bars)),
+        "broad_trend": trend,
+        "broad_trend_score": trend_structure_score,
+        "local_trend": local_trend,
+        "local_trend_score": local_trend_score,
+        "local_trend_evidence": local_trend_evidence,
+        "local_trend_lookback_bars": local_trend_lookback_bars,
         "short_term_trend": str(latest_row.get("Short_Term_Trend", trend)),
         "medium_term_trend": str(latest_row.get("Medium_Term_Trend", trend)),
         "long_term_trend": str(latest_row.get("Long_Term_Trend", trend)),
@@ -1929,11 +2170,11 @@ def analyze_stock(
     symbol: str,
     period: str = "1mo",
     interval: str = "15m",
-    as_of: Optional[pd.Timestamp] = None,
+    as_of: pd.Timestamp | None = None,
     lookback_bars: int = 12,
     top_pattern_count: int = 3,
     display_timezone: str = "Asia/Jerusalem",
-    instrument: Optional[ResolvedInstrument] = None,
+    instrument: ResolvedInstrument | None = None,
     provider: MarketDataProvider | None = None,
     data_file: str | None = None,
     exchange_timezone: str | None = None,

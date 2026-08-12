@@ -171,7 +171,10 @@ def test_latest_completed_pinbar_stays_new_with_no_retest() -> None:
         if pattern["pattern_completion_index"] == len(df) - 1
     ]
     assert {pattern["detector_label"] for pattern in latest_labels} >= {"Bullish Pin Bar", "Doji"}
-    assert canonical["matched_detector_labels"] == ["Bullish Pin Bar", "Doji"]
+    # Stage 4 removed Hammer's old asymmetry of silently dropping non-validated geometry, so a
+    # geometry-only lower-wick rejection now also surfaces a Hammer "Lower-Wick Rejection" event
+    # alongside Bullish Pin Bar's, sharing the same canonical same-bar candle event.
+    assert canonical["matched_detector_labels"] == ["Bullish Pin Bar", "Doji", "Hammer"]
     assert all(pattern["event_state"] == "new" for pattern in latest_labels)
 
 
@@ -280,9 +283,12 @@ def test_overlapping_pinbar_and_doji_form_one_canonical_event() -> None:
     assert len(result["current_relevant_patterns"]) == 1
     canonical = result["current_relevant_patterns"][0]
     assert canonical["primary_pattern_name"] == "Lower-Wick Rejection"
-    assert canonical["pattern_labels"] == ["Bullish Pin Bar", "Doji"]
-    assert canonical["label_count"] == 2
-    assert canonical["overlap_label_count"] == 1
+    # Stage 4 removed Hammer's old asymmetry of silently dropping non-validated geometry, so a
+    # geometry-only lower-wick rejection now also surfaces a Hammer candidate in this same-bar
+    # canonical group, alongside Bullish Pin Bar and Doji.
+    assert canonical["pattern_labels"] == ["Bullish Pin Bar", "Doji", "Hammer"]
+    assert canonical["label_count"] == 3
+    assert canonical["overlap_label_count"] == 2
     assert canonical["state"] == "new"
     assert "grouped into 1 candlestick event" in canonical["overlap_note"]
 
@@ -458,7 +464,7 @@ def test_session_history_is_rendered_in_display_timezone() -> None:
     result = analyze_dataframe(df, symbol="TEXT", as_of=analysis_as_of(df), top_pattern_count=10)
     report = format_analysis_text(result)
 
-    assert "Current Contributing Evidence (" in report
+    assert "Current Score-Contributing Evidence (" in report
     assert "Current Neutral / Informational Evidence (" in report
     assert "Historical Session Detections (" in report
     assert "Asia/Jerusalem" in report
@@ -527,6 +533,12 @@ def test_double_bottom_awaiting_confirmation_uses_confirmation_reason_not_horizo
     assert double_bottom["state"] == "awaiting_confirmation"
     assert double_bottom["included_in_current_score"] is False
     assert double_bottom["current_score_exclusion_reason"] == "awaiting neckline confirmation"
+    # state_updated_at must never precede detected_at: the second pivot's own candle
+    # (setup_completion_index) predates the point where the pivot became algorithmically
+    # confirmable (detected_index, pivot_right_bars later), so anchoring the "awaiting
+    # confirmation" state on setup_completion_index made it look like the state changed
+    # before the system could even recognize the pattern existed.
+    assert double_bottom["state_updated_at"] >= double_bottom["detected_at"]
 
 
 def test_double_bottom_awaiting_confirmation_expires_after_structural_window() -> None:
@@ -602,7 +614,6 @@ def test_primary_evidence_collections_are_pairwise_disjoint() -> None:
     collections = [
         result["current_contributing_evidence"],
         result["awaiting_confirmation_evidence"],
-        result["current_conflicting_evidence"],
         result["current_neutral_evidence"],
         result["recent_non_contributing_tracked_events"],
         result["historical_lifecycle_events"],
@@ -612,3 +623,130 @@ def test_primary_evidence_collections_are_pairwise_disjoint() -> None:
         ids = {event["event_id"] for event in collection}
         assert seen_ids.isdisjoint(ids)
         seen_ids |= ids
+
+    # directionally_conflicting_scored_evidence is a labeled VIEW over
+    # current_contributing_evidence (not a separate partition member), so it must be a
+    # subset, never introduce event IDs absent from the contributing set.
+    contributing_ids = {event["event_id"] for event in result["current_contributing_evidence"]}
+    conflicting_ids = {event["event_id"] for event in result["directionally_conflicting_scored_evidence"]}
+    assert conflicting_ids <= contributing_ids
+
+
+def test_archived_and_total_session_lifecycle_summaries_use_consistent_disjoint_scopes() -> None:
+    """`Archived Lifecycle Summary` (formerly "Historical Lifecycle Summary") and the
+    session-context "Total session lifecycle summary" line intentionally cover different
+    populations: the former only events no longer current-relevant, the latter every
+    canonical event detected in the session (current + archived). This checks that
+    distinction holds without any event being silently dropped or double-counted within
+    either tally, and that the current labels make the scope difference explicit.
+    """
+    df = make_session("2026-07-20")
+    set_bearish_engulfing(df, 3, 4)  # early in the session -> ages out into the archive
+    set_bullish_pinbar_only(df, 29)  # latest completed candle -> stays current-relevant
+
+    result = analyze_dataframe(df, symbol="SCOPE", as_of=analysis_as_of(df), top_pattern_count=10)
+
+    archived = result["historical_lifecycle_events"]
+    session_history = result["session_pattern_history"]
+
+    # The early bearish engulfing aged out into the archive; the fresh pin bar (canonicalized
+    # as "Lower-Wick Rejection") did not.
+    assert any(event["primary_pattern_name"] == "Bearish Engulfing" for event in archived)
+    assert all("Bullish Pin Bar" not in event["matched_detector_labels"] for event in archived)
+    assert any(
+        "Bullish Pin Bar" in event["matched_detector_labels"] for event in session_history
+    )
+
+    # Session-wide totals must be a strict superset of the archived-only totals here,
+    # since at least one event (the pin bar) is current-relevant and only in the wider scope.
+    assert len(session_history) > len(archived)
+
+    historical_summary = result["historical_lifecycle_summary"]
+    # No double counting: the archived summary's own by-state breakdown sums to its own count.
+    if historical_summary.get("by_state"):
+        assert sum(historical_summary["by_state"].values()) == historical_summary["count"]
+    assert historical_summary["count"] == len(archived)
+
+    text = format_analysis_text(result)
+    assert "Archived Lifecycle Summary" in text
+    assert "Total session lifecycle summary (including current events)" in text
+
+
+def test_lopsided_conflict_keeps_majority_side_as_contributing() -> None:
+    """A decisive, lopsided score (two aligned bearish breakdowns vs. one bullish
+    outlier) must not exclude the minority side from score-contributing evidence just
+    because it disagrees with the winning bias -- it is still `included_in_current_score`
+    and still summed into the net score. Bias-alignment and directional conflict are
+    reported as separate, additive facts about the same contributing set, not as a
+    reason to move events out of it.
+    """
+    df = make_session("2026-07-20", start_price=101.5, step=-0.18)
+    df.loc[10, ["Open", "High", "Low", "Close", "Volume"]] = [99.8, 101.2, 99.7, 101.0, 2600]
+    df.loc[11, ["Open", "High", "Low", "Close", "Volume"]] = [101.1, 101.3, 99.4, 99.6, 2800]
+    df.loc[20, ["Open", "High", "Low", "Close", "Volume"]] = [98.0, 100.5, 97.9, 100.2, 3200]
+    df.loc[21, ["Open", "High", "Low", "Close", "Volume"]] = [100.3, 100.6, 96.5, 96.8, 3400]
+    df.loc[len(df) - 1, ["Open", "High", "Low", "Close", "Volume"]] = [96.00, 96.05, 94.50, 96.02, 4200]
+
+    result = analyze_dataframe(df, symbol="LOPSIDED", as_of=analysis_as_of(df), top_pattern_count=10)
+
+    assert result["overall_bias"] == "Bearish"
+
+    # All three score-contributing events stay contributing, regardless of bias alignment.
+    contributing_biases = [event["bias"] for event in result["current_contributing_evidence"]]
+    assert contributing_biases.count("Bearish") == 2
+    assert contributing_biases.count("Bullish") == 1
+    assert len(result["current_contributing_evidence"]) == 3
+
+    # Alignment/conflict are separate, additive facts about that same set.
+    assert result["score_contributing_bullish_count"] == 1
+    assert result["score_contributing_bearish_count"] == 2
+    assert result["bias_aligned_evidence_count"] == 2  # only the two Bearish ones align
+    assert result["directional_conflict_present"] is True
+
+    conflicting_biases = {event["bias"] for event in result["directionally_conflicting_scored_evidence"]}
+    assert conflicting_biases == {"Bullish"}
+    assert len(result["directionally_conflicting_scored_evidence"]) == 1
+
+    text = format_analysis_text(result)
+    assert "Current Score-Contributing Evidence Count: 3" in text
+    assert "Score-Contributing Bullish Evidence Count: 1" in text
+    assert "Score-Contributing Bearish Evidence Count: 2" in text
+    assert "Bias-Aligned Evidence Count: 2" in text
+    assert "Directional Conflict Present: Yes" in text
+    assert "Directionally Conflicting Scored Evidence Count: 1" in text
+
+
+def test_evidence_counts_agree_across_top_level_collections_and_session_context() -> None:
+    """Required test 3/14/15: top-level counts, detailed collections, and the Session Context
+    narrative must all be derived from the same canonical event list -- no separate tally can
+    silently drift from the others. Also locks in unique canonical-event counting and
+    state_updated_at >= detected_at as session-wide invariants, not just single-pattern checks.
+    """
+    df = make_session("2026-07-20", start_price=101.5, step=-0.18)
+    df.loc[10, ["Open", "High", "Low", "Close", "Volume"]] = [99.8, 101.2, 99.7, 101.0, 2600]
+    df.loc[11, ["Open", "High", "Low", "Close", "Volume"]] = [101.1, 101.3, 99.4, 99.6, 2800]
+    df.loc[len(df) - 1, ["Open", "High", "Low", "Close", "Volume"]] = [96.00, 96.05, 94.50, 96.02, 4200]
+
+    result = analyze_dataframe(df, symbol="CONSISTENCY", as_of=analysis_as_of(df), top_pattern_count=10)
+
+    # Top-level counts must equal the corresponding detailed collection lengths exactly.
+    assert result["score_contributing_bullish_count"] + result["score_contributing_bearish_count"] == len(
+        result["current_contributing_evidence"]
+    )
+    assert len(result["directionally_conflicting_scored_evidence"]) <= len(result["current_contributing_evidence"])
+
+    # Unique canonical-event counting: no canonical event appears twice in the session history.
+    session_history = result["session_pattern_history"]
+    assert len(session_history) == len({event["event_id"] for event in session_history})
+
+    # Session Context's own tallies must agree with the canonical session_pattern_history list
+    # it was built from, not some separately-drifted count.
+    session_context = result["structured_explanation"]["session_context"]
+    assert any(f"{len(session_history)} canonical pattern event(s)" in line for line in session_context)
+    contributing_in_session = sum(1 for event in session_history if event["included_in_current_score"])
+    assert any(f"{contributing_in_session} currently contribute" in line for line in session_context)
+
+    # state_updated_at must never precede detected_at for any canonical event, session-wide.
+    for event in session_history:
+        if event.get("state_updated_at") is not None:
+            assert event["state_updated_at"] >= event["detected_at"]

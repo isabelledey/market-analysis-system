@@ -9,7 +9,6 @@ import pandas as pd
 
 from stock_pattern_model.datetime_utils import to_zoneinfo
 
-
 DEFAULT_REGULAR_SESSION_START = "09:30"
 DEFAULT_REGULAR_SESSION_END = "16:00"
 DEFAULT_SESSION_MODE = "regular"
@@ -70,6 +69,22 @@ def session_date_series(
 ) -> pd.Series:
     exchange_datetimes = exchange_datetime_series(datetimes, exchange_timezone)
     return exchange_datetimes.dt.strftime("%Y-%m-%d")
+
+
+def session_date_for_timestamp(
+    timestamp: pd.Timestamp,
+    exchange_timezone: str | ZoneInfo | None = None,
+) -> str:
+    """Scalar counterpart to session_date_series, for one-off timestamp comparisons."""
+    if exchange_timezone is None:
+        return timestamp.strftime("%Y-%m-%d")
+    zone = to_zoneinfo(exchange_timezone)
+    localized = (
+        timestamp.tz_convert(zone)
+        if timestamp.tzinfo is not None
+        else timestamp.tz_localize(zone, ambiguous="infer", nonexistent="shift_forward")
+    )
+    return localized.strftime("%Y-%m-%d")
 
 
 def session_segment_series(

@@ -5,8 +5,10 @@ from __future__ import annotations
 import pandas as pd
 
 from stock_pattern_model.config import MarketDataConfig
-from stock_pattern_model.market_data import REQUIRED_COLUMNS
-from stock_pattern_model.market_data import YFinanceProvider
+from stock_pattern_model.market_data import (
+    REQUIRED_COLUMNS,  # noqa: F401  # re-exported for stock_pattern_model.data_loader's deprecated root-level wrapper
+    YFinanceProvider,
+)
 
 
 def load_stock_data(

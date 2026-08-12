@@ -4,31 +4,31 @@ from __future__ import annotations
 
 import argparse
 import logging
+from collections.abc import Sequence
 from enum import IntEnum
 from pathlib import Path
 from typing import Callable
-from typing import Sequence
 
 import pandas as pd
 
 from stock_pattern_model.analysis import analyze_stock
 from stock_pattern_model.config import SUPPORTED_INTERVALS
 from stock_pattern_model.domain import ResolvedInstrument
-from stock_pattern_model.exceptions import ConfigurationError
-from stock_pattern_model.exceptions import DataValidationError
-from stock_pattern_model.exceptions import InvalidMappingFileError
-from stock_pattern_model.exceptions import InvalidInstrumentError
-from stock_pattern_model.exceptions import MarketDataError
-from stock_pattern_model.exceptions import MissingDataFileError
-from stock_pattern_model.exceptions import MissingMappingFileError
-from stock_pattern_model.exceptions import NoCompletedBarsError
-from stock_pattern_model.exceptions import OutputFileError
-from stock_pattern_model.exceptions import UnknownSecurityNumberError
-from stock_pattern_model.formatters import format_analysis_json
-from stock_pattern_model.formatters import format_analysis_text
+from stock_pattern_model.exceptions import (
+    ConfigurationError,
+    DataValidationError,
+    InvalidInstrumentError,
+    InvalidMappingFileError,
+    MarketDataError,
+    MissingDataFileError,
+    MissingMappingFileError,
+    NoCompletedBarsError,
+    OutputFileError,
+    UnknownSecurityNumberError,
+)
+from stock_pattern_model.formatters import format_analysis_json, format_analysis_text
 from stock_pattern_model.resolver import CsvInstrumentResolver
 from stock_pattern_model.session_utils import SUPPORTED_SESSION_MODES
-
 
 LOGGER = logging.getLogger(__name__)
 
@@ -244,7 +244,7 @@ def main(
     except KeyboardInterrupt:
         print("Analysis interrupted.")
         return ExitCode.INTERRUPTED
-    except Exception as error:  # noqa: BLE001
+    except Exception as error:
         if getattr(args, "verbose", False):
             LOGGER.exception("Unexpected internal failure")
             print(str(error))

@@ -406,6 +406,41 @@ def test_retry_behavior(monkeypatch: pytest.MonkeyPatch) -> None:
     assert sleeps == [0.1, 0.2]
 
 
+def test_load_with_context_preserves_resolved_instrument_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression test: YFinanceProvider.load() used to always rebuild its refined context with
+    instrument=None, even when a context carrying an already-resolved instrument was passed in --
+    silently dropping name/exchange/currency/etc. from the returned metadata.
+    """
+    from stock_pattern_model.context import build_analysis_context
+    from stock_pattern_model.domain import ResolvedInstrument
+
+    sample_df = make_df()
+    resolved = ResolvedInstrument(
+        input_identifier="AAPL",
+        symbol="AAPL",
+        name="Apple Inc.",
+        exchange="NMS",
+        currency="USD",
+        exchange_timezone="America/New_York",
+    )
+    context = build_analysis_context(
+        symbol="AAPL",
+        interval="15m",
+        display_timezone="Asia/Jerusalem",
+        session_mode="regular",
+        instrument=resolved,
+        provider="resolver",
+    )
+
+    provider = YFinanceProvider(config=MarketDataConfig(use_cache=False))
+    monkeypatch.setattr(provider, "_download", lambda *args, **kwargs: (sample_df.copy(), {"source": "yfinance"}))
+
+    payload = provider.load(symbol="AAPL", interval="15m", period="1mo", context=context)
+
+    assert payload.metadata["instrument_metadata"]["name"] == "Apple Inc."
+    assert payload.metadata["instrument_metadata"]["currency"] == "USD"
+
+
 def test_offline_file_based_analysis() -> None:
     fixture_path = FIXTURE_DIR / "sample_ohlcv.csv"
 

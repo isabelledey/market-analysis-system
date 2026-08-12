@@ -5,6 +5,20 @@ from __future__ import annotations
 import json
 from typing import Any
 
+_PATTERN_ENTRY_MOVE_LABELS = {
+    "Uptrend": "Advance",
+    "Downtrend": "Decline",
+    "Sideways": "Sideways",
+    "Ambiguous": "Ambiguous",
+    "Not Applicable": None,
+}
+
+
+def _pattern_entry_move_display(pattern_entry_trend: str | None) -> str | None:
+    if not pattern_entry_trend:
+        return None
+    return _PATTERN_ENTRY_MOVE_LABELS.get(pattern_entry_trend, pattern_entry_trend)
+
 
 def _append_transition_lines(lines: list[str], pattern: dict[str, Any], *, indent: str) -> None:
     for label, key in (
@@ -38,7 +52,7 @@ def format_analysis_text(
     session_history = result.get("session_pattern_history") or []
     current_contributing = result.get("current_contributing_evidence") or []
     awaiting_confirmation = result.get("awaiting_confirmation_evidence") or []
-    current_conflicting = result.get("current_conflicting_evidence") or []
+    directionally_conflicting = result.get("directionally_conflicting_scored_evidence") or []
     current_neutral = result.get("current_neutral_evidence") or []
     historical_lifecycle = result.get("historical_lifecycle_events") or []
     recent_non_contributing = result.get("recent_non_contributing_tracked_events") or []
@@ -72,6 +86,10 @@ def format_analysis_text(
         f"Data Quality: {result.get('data_quality_report', {}).get('completed_row_count', 'Unknown')} "
         f"completed rows / {result.get('data_quality_report', {}).get('row_count', 'Unknown')} total rows",
         f"Trend: {result.get('trend', 'Unknown')}",
+        f"Broad Trend: {result.get('broad_trend', result.get('trend', 'Unknown'))}",
+        f"Local Session Trend: {result.get('local_trend', 'Unknown')} "
+        f"({result.get('local_trend_score', 'Unknown')}, "
+        f"lookback {result.get('local_trend_lookback_bars', 'Unknown')} bars)",
         f"Trend Horizon: {result.get('trend_horizon', 'Unknown')}",
         f"Market State: {result.get('market_state', 'Unknown')}",
         f"Overall Bias: {result.get('overall_bias', 'Unknown')}",
@@ -86,12 +104,19 @@ def format_analysis_text(
         f"Short-Term Trend: {result.get('short_term_trend', 'Unknown')} ({result.get('short_term_trend_score', 'Unknown')})",
         f"Medium-Term Trend: {result.get('medium_term_trend', 'Unknown')} ({result.get('medium_term_trend_score', 'Unknown')})",
         f"Long-Term Trend: {result.get('long_term_trend', 'Unknown')} ({result.get('long_term_trend_score', 'Unknown')})",
-        f"Current Contributing Evidence Count: {len(current_contributing)}",
+        f"Current Score-Contributing Evidence Count: {len(current_contributing)}",
+        f"Score-Contributing Bullish Evidence Count: {result.get('score_contributing_bullish_count', 0)}",
+        f"Score-Contributing Bearish Evidence Count: {result.get('score_contributing_bearish_count', 0)}",
+        (
+            "Bias-Aligned Evidence Count: "
+            f"{result.get('bias_aligned_evidence_count') if result.get('bias_aligned_evidence_count') is not None else 'Not Applicable'}"
+        ),
+        f"Directional Conflict Present: {'Yes' if result.get('directional_conflict_present') else 'No'}",
         f"Awaiting Confirmation Count: {len(awaiting_confirmation)}",
-        f"Current Conflicting Evidence Count: {len(current_conflicting)}",
+        f"Directionally Conflicting Scored Evidence Count: {len(directionally_conflicting)}",
         f"Current Neutral Evidence Count: {len(current_neutral)}",
         f"Recent Non-Contributing Tracked Event Count: {len(recent_non_contributing)}",
-        f"Historical Lifecycle Event Count: {len(historical_lifecycle)}",
+        f"Archived Lifecycle Event Count: {len(historical_lifecycle)}",
     ]
 
     def append_event_section(title: str, patterns: list[dict[str, Any]]) -> None:
@@ -108,9 +133,41 @@ def format_analysis_text(
             lines.append(f"  Family: {pattern.get('family', 'unknown')}")
             lines.append(f"  State: {pattern.get('state', 'unknown')}")
             lines.append(f"  Status: {pattern.get('status', 'unknown')}")
+            # Status alone is ambiguous ("confirmed" could mean geometry, context, or direction
+            # was confirmed). These four fields spell out exactly which claim is being made.
+            lines.append(f"  Geometry Status: {pattern.get('geometry_status', 'Validated')}")
+            lines.append(f"  Context Status: {pattern.get('context_status', 'Not Applicable')}")
+            lines.append(f"  Directional Confirmation: {pattern.get('directional_confirmation', 'Not Required')}")
+            lines.append(f"  Follow-Through: {pattern.get('follow_through', 'Not Applicable')}")
             lines.append(f"  Bias: {pattern.get('bias', 'Unknown')}")
             lines.append(f"  Geometry: {pattern.get('geometry_label', 'unknown')}")
             lines.append(f"  Context Quality: {pattern.get('context_quality', 'unknown')}")
+            pre_pattern_move = _pattern_entry_move_display(pattern.get("pattern_entry_trend"))
+            if pre_pattern_move:
+                lines.append(f"  Immediate Pre-Pattern Move: {pre_pattern_move}")
+            if pattern.get("dampener_eligible") or pattern.get("rejection_confirmation_state") not in (None, "not_applicable"):
+                lines.append(f"  Rejection Confirmation State: {pattern.get('rejection_confirmation_state')}")
+                # dampener_eligible is a static, detection-time flag (true once context-validated)
+                # and stays true even after later directional confirmation -- only show the
+                # dampener note while it is actually the mechanism driving the contribution
+                # (directional_confirmation == "Pending"), not just because it was once eligible.
+                if pattern.get("dampener_eligible") and pattern.get("directional_confirmation") == "Pending":
+                    # The dampener nudges the *opposite* side of the pattern's own bias: a Bullish
+                    # pattern (e.g. Hammer) dampens the Bearish score, while a Bearish pattern
+                    # (e.g. Shooting Star) dampens the Bullish score. Must match this pattern's own
+                    # bias, not be hardcoded -- see the equivalent, correctly bias-aware wording in
+                    # ScoringService's dampener_notes.
+                    dampened_side = "Bearish" if pattern.get("bias") == "Bullish" else "Bullish"
+                    lines.append(f"  {dampened_side}-Score Dampener: Active (unconfirmed, bounded)")
+                if pattern.get("confirmed_at"):
+                    lines.append(f"  Directionally Confirmed At: {pattern['confirmed_at']}")
+            if pattern.get("cluster_id"):
+                lines.append(f"  Cluster: {pattern.get('cluster_type')} ({pattern.get('cluster_size')} members)")
+                lines.append(f"  Cluster Strongest Score: {pattern.get('cluster_strongest_score')}")
+                lines.append(f"  Cluster Repetition Bonus: {pattern.get('cluster_repetition_bonus')}")
+                lines.append(f"  Cluster Bounded Contribution: {pattern.get('cluster_bounded_contribution')}")
+                if pattern.get("cluster_penalties_applied"):
+                    lines.append(f"  Cluster Penalties Applied: {', '.join(pattern['cluster_penalties_applied'])}")
             lines.append(f"  Pattern Start: {pattern.get('pattern_start_display', 'Unknown')}")
             lines.append(f"  Setup Completion: {pattern.get('setup_completion_display', pattern.get('pattern_completion_display', 'Unknown'))}")
             lines.append(f"  Pattern Completion: {pattern.get('pattern_completion_display', 'Unknown')}")
@@ -121,7 +178,14 @@ def format_analysis_text(
             lines.append(f"  Display Timezone: {pattern.get('display_timezone', 'Unknown')}")
             lines.append(f"  Signal Strength: {pattern.get('signal_strength', 'Unknown')}")
             lines.append(f"  Pattern Score Contribution: {pattern.get('pattern_score_contribution', 0.0)}")
-            lines.append(f"  Volume Score Contribution: {pattern.get('volume_score_contribution', 0.0)}")
+            lines.append(f"  Volume Score Contribution (Applied): {pattern.get('volume_score_contribution', 0.0)}")
+            raw_volume = pattern.get("raw_volume_score_contribution", pattern.get("volume_score_contribution", 0.0))
+            if raw_volume != pattern.get("volume_score_contribution", 0.0):
+                lines.append(f"  Raw Volume Contribution: {raw_volume}")
+            if pattern.get("volume_evidence_id"):
+                lines.append(f"  Volume Evidence ID: {pattern['volume_evidence_id']}")
+            if pattern.get("volume_deduplication_reason"):
+                lines.append(f"  Volume Deduplication Reason: {pattern['volume_deduplication_reason']}")
             lines.append(f"  Combined Event Contribution: {pattern.get('combined_event_contribution', pattern.get('current_weighted_score', 0.0))}")
             lines.append(f"  Recency Weight: {pattern.get('recency_weight', 'Unknown')}")
             lines.append(f"  Score Eligible: {'Yes' if pattern.get('score_eligible') else 'No'}")
@@ -135,9 +199,21 @@ def format_analysis_text(
             if pattern.get("related_note"):
                 lines.append(f"  Relationship Note: {pattern['related_note']}")
 
-    append_event_section("Current Contributing Evidence", current_contributing)
+    append_event_section("Current Score-Contributing Evidence", current_contributing)
+    lines.append(f"Directionally Conflicting Scored Evidence ({len(directionally_conflicting)}):")
+    if directionally_conflicting:
+        lines.append(
+            "  (Already included above under Current Score-Contributing Evidence; flagged here "
+            "only to show which of those events disagree on direction.)"
+        )
+        for pattern in directionally_conflicting:
+            lines.append(
+                f"  - {pattern.get('primary_pattern_name', 'Unknown')} "
+                f"[{pattern.get('bias', 'Unknown')}] (event_id={pattern.get('event_id', 'Unknown')})"
+            )
+    else:
+        lines.append("  None")
     append_event_section("Awaiting Confirmation", awaiting_confirmation)
-    append_event_section("Conflicting Evidence", current_conflicting)
     append_event_section("Current Neutral / Informational Evidence", current_neutral)
     append_event_section("Recent Non-Contributing Tracked Events", recent_non_contributing)
 
@@ -186,9 +262,9 @@ def format_analysis_text(
         else:
             lines.append("  None")
 
-    lines.append("Historical Lifecycle Summary:")
+    lines.append("Archived Lifecycle Summary (events no longer current-relevant; excludes anything shown above as current):")
     if historical_summary:
-        lines.append(f"  Total Historical Lifecycle Events: {historical_summary.get('count', len(historical_lifecycle))}")
+        lines.append(f"  Total Archived Lifecycle Events: {historical_summary.get('count', len(historical_lifecycle))}")
         if historical_summary.get("by_state"):
             lines.append(
                 "  By State: "
@@ -198,6 +274,14 @@ def format_analysis_text(
             lines.append(
                 "  By Family: "
                 + ", ".join(f"{family}={count}" for family, count in historical_summary["by_family"].items())
+            )
+        archived_active_count = historical_summary.get("by_state", {}).get("active", 0)
+        if archived_active_count:
+            lines.append(
+                f"  Note: {archived_active_count} archived event(s) still carry lifecycle state "
+                "'active' -- their setup was never invalidated, expired, or failed, but they aged "
+                "out of the current display/scoring window. 'Active' here describes the pattern's "
+                "own lifecycle state, not current relevance."
             )
     else:
         lines.append("  None")
@@ -210,6 +294,13 @@ def format_analysis_text(
                 lines.append(f"  Family: {pattern.get('pattern_family', 'unknown')}")
                 lines.append(f"  Status: {pattern.get('status', 'confirmed')}")
                 lines.append(f"  State: {pattern.get('event_state', 'unknown')}")
+                lines.append(f"  Geometry Status: {pattern.get('geometry_status', 'Validated')}")
+                lines.append(f"  Context Status: {pattern.get('context_status', 'Not Applicable')}")
+                lines.append(f"  Directional Confirmation: {pattern.get('directional_confirmation', 'Not Required')}")
+                lines.append(f"  Follow-Through: {pattern.get('follow_through', 'Not Applicable')}")
+                pre_pattern_move = _pattern_entry_move_display(pattern.get("pattern_entry_trend"))
+                if pre_pattern_move:
+                    lines.append(f"  Immediate Pre-Pattern Move: {pre_pattern_move}")
                 lines.append(f"  Bias: {pattern['bias']}")
                 lines.append(
                     f"  Pattern Start: {pattern.get('pattern_start_display', pattern.get('bar_start_display', 'Unknown'))}"
@@ -275,6 +366,14 @@ def format_analysis_text(
     if structured.get("lifecycle_note"):
         lines.append("Lifecycle Note:")
         lines.append(f"  {structured['lifecycle_note']}")
+    if structured.get("cluster_notes"):
+        lines.append("Rejection/Reversal Clusters:")
+        for item in structured["cluster_notes"]:
+            lines.append(f"  - {item}")
+    if structured.get("dampener_notes"):
+        lines.append("Unconfirmed Dampener Signals:")
+        for item in structured["dampener_notes"]:
+            lines.append(f"  - {item}")
     if structured.get("conflicts"):
         lines.append("Conflicts:")
         for item in structured["conflicts"]:

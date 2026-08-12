@@ -5,15 +5,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import time
 from pathlib import Path
-from zoneinfo import ZoneInfo
-from zoneinfo import ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from stock_pattern_model.exceptions import ConfigurationError
-from stock_pattern_model.session_utils import DEFAULT_REGULAR_SESSION_END
-from stock_pattern_model.session_utils import DEFAULT_REGULAR_SESSION_START
-from stock_pattern_model.session_utils import DEFAULT_SESSION_MODE
-from stock_pattern_model.session_utils import normalize_session_mode
-
+from stock_pattern_model.session_utils import (
+    DEFAULT_REGULAR_SESSION_END,
+    DEFAULT_REGULAR_SESSION_START,
+    DEFAULT_SESSION_MODE,
+    normalize_session_mode,
+)
 
 SUPPORTED_INTERVALS = (
     "1m",
@@ -51,7 +51,27 @@ class PatternConfig:
     double_pattern_min_separation_bars: int = 4
     double_pattern_max_separation_bars: int = 24
     double_pattern_min_valley_depth_ratio: float = 0.008
+    # Price-tolerance ratio for merging near-duplicate Double Top/Bottom detections that share the
+    # same setup_completion bar and lifecycle stage (see pattern_detector.deduplicate_structural_events).
+    structural_duplicate_price_tolerance: float = 0.005
     score_tentative_patterns: bool = False
+    # How many bars the session-anchored local trend (features.py-independent of the broad
+    # multi-horizon trend) looks back, capped to the current session. See
+    # pattern_detector.classify_local_session_trend.
+    local_trend_lookback_bars: int = 20
+    # Dedicated prefix-only lookback for the trend evaluated immediately before a detected
+    # candlestick pattern (pattern_entry_trend), independent of the broad trend's horizons. See
+    # pattern_detector.classify_prior_pattern_context.
+    pattern_entry_trend_lookback_bars: int = 15
+    # Minimum ATR-normalized price displacement required for a preceding move to count as a
+    # genuine uptrend/downtrend context (not just noise) when validating a candlestick pattern.
+    context_minimum_displacement_atr: float = 1.25
+    # How many prior bars to search for a recent swing high/low when checking whether a rejection
+    # candle is near resistance (Shooting Star) or support (Hammer/Bullish Pin Bar).
+    resistance_proximity_lookback_bars: int = 30
+    # How close (as a ratio of price) a candle's high/low must be to that recent swing level to
+    # count as "near" resistance/support.
+    support_resistance_proximity_tolerance: float = 0.005
 
     def validate(self) -> None:
         if self.breakout_lookback < 2:
@@ -84,6 +104,18 @@ class PatternConfig:
             raise ConfigurationError("double_pattern_price_tolerance_ratio must be >= 0.")
         if self.double_pattern_min_valley_depth_ratio < 0:
             raise ConfigurationError("double_pattern_min_valley_depth_ratio must be >= 0.")
+        if self.structural_duplicate_price_tolerance < 0:
+            raise ConfigurationError("structural_duplicate_price_tolerance must be >= 0.")
+        if self.local_trend_lookback_bars < 5:
+            raise ConfigurationError("local_trend_lookback_bars must be at least 5.")
+        if self.pattern_entry_trend_lookback_bars < 5:
+            raise ConfigurationError("pattern_entry_trend_lookback_bars must be at least 5.")
+        if self.context_minimum_displacement_atr <= 0:
+            raise ConfigurationError("context_minimum_displacement_atr must be positive.")
+        if self.resistance_proximity_lookback_bars < 5:
+            raise ConfigurationError("resistance_proximity_lookback_bars must be at least 5.")
+        if self.support_resistance_proximity_tolerance < 0:
+            raise ConfigurationError("support_resistance_proximity_tolerance must be >= 0.")
 
 
 @dataclass(frozen=True)
@@ -110,6 +142,21 @@ class ScoringConfig:
     conflict_neutrality_ratio: float = 0.65
     duplicate_group_confidence_penalty: float = 4.0
     data_warning_confidence_penalty: float = 5.0
+    # Maximum bar distance between consecutive same-family, same-direction rejection events for
+    # them to chain into one correlated cluster (see ScoringService._cluster_correlated_patterns).
+    cluster_max_bar_distance: int = 5
+    # How close (as a ratio of price) two events' own tested price extremes must be to count as
+    # "the same zone" for clustering.
+    cluster_price_zone_tolerance: float = 0.006
+    # Bonus added per extra clustered member beyond the strongest one, before the cap is applied.
+    cluster_repetition_bonus: float = 1.5
+    # Cluster contribution is capped at the strongest member's own score times this multiplier, so
+    # a cluster of correlated events can never approach the sum of their raw scores.
+    cluster_max_contribution_multiplier: float = 1.35
+    # Small, fixed bullish/bearish nudge for a context-validated lower/upper-wick rejection that is
+    # still awaiting directional confirmation (see ScoringService._dampener_contribution). Deliberately
+    # bypasses base_score entirely so it can never approach a directionally confirmed contribution.
+    unconfirmed_rejection_dampener: float = 1.5
 
     def validate(self) -> None:
         if self.lookback_bars < 1:
@@ -152,6 +199,16 @@ class ScoringConfig:
             raise ConfigurationError("duplicate_group_confidence_penalty must be >= 0.")
         if self.data_warning_confidence_penalty < 0:
             raise ConfigurationError("data_warning_confidence_penalty must be >= 0.")
+        if self.cluster_max_bar_distance < 1:
+            raise ConfigurationError("cluster_max_bar_distance must be at least 1.")
+        if self.cluster_price_zone_tolerance < 0:
+            raise ConfigurationError("cluster_price_zone_tolerance must be >= 0.")
+        if self.cluster_repetition_bonus < 0:
+            raise ConfigurationError("cluster_repetition_bonus must be >= 0.")
+        if self.cluster_max_contribution_multiplier < 1:
+            raise ConfigurationError("cluster_max_contribution_multiplier must be >= 1.")
+        if self.unconfirmed_rejection_dampener < 0:
+            raise ConfigurationError("unconfirmed_rejection_dampener must be >= 0.")
 
 
 @dataclass(frozen=True)

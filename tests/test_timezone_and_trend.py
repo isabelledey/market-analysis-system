@@ -239,13 +239,20 @@ def test_overlapping_pin_bar_and_doji_are_grouped_as_one_evidence_event() -> Non
     ]
 
     assert {pattern["detector_label"] for pattern in latest_bar_patterns} >= {"Bullish Pin Bar", "Doji"}
-    assert sum(1 for pattern in latest_bar_patterns if pattern["group_primary"]) == 0
+    # The lower wick sits right at this mild uptrend's rolling low, so Stage 4's staged
+    # confirmation model now treats Bullish Pin Bar/Hammer as context-validated (near support)
+    # even though there was no genuine preceding downtrend: they become a bounded, unconfirmed
+    # bullish dampener signal (one canonical group member is `group_primary`) instead of staying
+    # purely informational/neutral. Doji itself stays Neutral and is never group_primary.
+    assert sum(1 for pattern in latest_bar_patterns if pattern["group_primary"]) == 1
     canonical_overlap = next(
         event
-        for event in result["current_neutral_evidence"]
-        if event["matched_detector_labels"] == ["Bullish Pin Bar", "Doji"]
+        for event in result["current_contributing_evidence"]
+        if event["matched_detector_labels"] == ["Bullish Pin Bar", "Doji", "Hammer"]
     )
     assert canonical_overlap["primary_pattern_name"] == "Lower-Wick Rejection"
+    assert canonical_overlap["dampener_eligible"] is True
+    assert canonical_overlap["rejection_confirmation_state"] == "context_validated"
 
 
 def test_trend_classifier_is_independent_from_pattern_scoring() -> None:

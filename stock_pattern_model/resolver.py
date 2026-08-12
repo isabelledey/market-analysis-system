@@ -7,10 +7,12 @@ from pathlib import Path
 from typing import Protocol
 
 from stock_pattern_model.domain import ResolvedInstrument
-from stock_pattern_model.exceptions import InvalidMappingFileError
-from stock_pattern_model.exceptions import InvalidInstrumentError
-from stock_pattern_model.exceptions import MissingMappingFileError
-from stock_pattern_model.exceptions import UnknownSecurityNumberError
+from stock_pattern_model.exceptions import (
+    InvalidInstrumentError,
+    InvalidMappingFileError,
+    MissingMappingFileError,
+    UnknownSecurityNumberError,
+)
 
 
 def normalize_identifier(value: str) -> str:

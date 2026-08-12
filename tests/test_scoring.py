@@ -293,6 +293,46 @@ def test_old_events_expire_and_do_not_drive_state() -> None:
     assert result["market_state"] == "Trend Only"
 
 
+def test_pattern_anchored_in_prior_session_does_not_score_in_new_session() -> None:
+    # Regression: bar-count age alone can't see overnight gaps. A pattern detected in the
+    # closing bars of the prior session must not count as "recent" just because few bars
+    # separate it from the first bars of the next session.
+    service = ScoringService(ScoringConfig())
+    patterns = [
+        make_pattern_record(
+            event=make_event(
+                pattern_id="bearish_engulfing",
+                pattern_name="Bearish Engulfing",
+                pattern_family=PatternFamily.ENGULFING,
+                bias="Bearish",
+                detected_at="2026-07-10 15:45",
+            ),
+            candles_ago=1,
+            event_state="active",
+            extra_fields={
+                "last_completed_candle_at": pd.Timestamp("2026-07-13 09:45", tz=EXCHANGE_TZ),
+            },
+        ),
+    ]
+
+    result = service.evaluate(
+        symbol="GAP",
+        trend="Neutral",
+        patterns=patterns,
+        quality_report=make_quality_report(),
+        latest_close=101.0,
+        latest_bar_start_display="2026-07-13 09:30 Asia/Jerusalem",
+        latest_bar_end_display="2026-07-13 09:45 Asia/Jerusalem",
+        interval="15m",
+        latest_volume_baseline_source="time_of_day",
+    )
+
+    pattern_result = result["patterns"][0]
+    assert pattern_result["score_eligible"] is False
+    assert pattern_result["score_eligibility"]["reason"] == "outside current trading session"
+    assert result["score"]["bearish_score"] == 0
+
+
 def test_breakout_uses_family_specific_horizon_instead_of_global_four_bar_expiry() -> None:
     service = ScoringService(
         ScoringConfig(

@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Any
 
@@ -136,6 +135,11 @@ class PatternEvent:
     context_bias: str = "Neutral"
     context_quality: str = "unknown"
     detector_version: str = "v1"
+    pattern_entry_trend: str = "Not Applicable"
+    pattern_entry_trend_score: float = 0.0
+    pattern_entry_trend_lookback_bars: int = 0
+    rejection_confirmation_state: str = "not_applicable"
+    dampener_eligible: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {

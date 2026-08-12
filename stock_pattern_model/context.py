@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from hashlib import sha256
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -12,10 +11,11 @@ import pandas as pd
 
 from stock_pattern_model.datetime_utils import ensure_timezone_aware
 from stock_pattern_model.domain import ResolvedInstrument
-from stock_pattern_model.session_utils import normalize_session_mode
-from stock_pattern_model.session_utils import session_mode_requires_extended_hours
-from stock_pattern_model.session_utils import session_segments_for_mode
-
+from stock_pattern_model.session_utils import (
+    normalize_session_mode,
+    session_mode_requires_extended_hours,
+    session_segments_for_mode,
+)
 
 EXCHANGE_PROFILE_BY_CODE: dict[str, dict[str, Any]] = {
     "NASDAQ": {
@@ -162,7 +162,7 @@ def instrument_metadata_from_sources(
     provider_metadata: dict[str, Any] | None = None,
     exchange_timezone_override: str | None = None,
     default_input_identifier: str | None = None,
-) -> "InstrumentMetadata":
+) -> InstrumentMetadata:
     """Merge resolver metadata, provider metadata, suffix hints, and explicit overrides."""
 
     flat_provider_metadata = _flatten_provider_metadata(provider_metadata)
@@ -376,7 +376,7 @@ class AnalysisContext:
         latest_completed_candle_end: pd.Timestamp | None = None,
         dataframe_identity_value: str | None = None,
         warnings: list[str] | tuple[str, ...] | None = None,
-    ) -> "AnalysisContext":
+    ) -> AnalysisContext:
         return AnalysisContext(
             instrument=self.instrument,
             provider=self.provider,

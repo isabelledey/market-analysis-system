@@ -17,7 +17,13 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "pytest",
+  "pytest-cov",
+  "mypy",
+  "ruff",
 ]
+
+[tool.setuptools.packages.find]
+include = ["stock_pattern_model*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

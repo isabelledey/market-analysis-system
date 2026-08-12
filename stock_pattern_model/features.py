@@ -7,11 +7,13 @@ import pandas as pd
 
 from stock_pattern_model.exceptions import DataValidationError
 from stock_pattern_model.market_data import REQUIRED_COLUMNS
-from stock_pattern_model.session_utils import DEFAULT_REGULAR_SESSION_END
-from stock_pattern_model.session_utils import DEFAULT_REGULAR_SESSION_START
-from stock_pattern_model.session_utils import pattern_session_key_series
-from stock_pattern_model.session_utils import session_date_series
-from stock_pattern_model.session_utils import session_segment_series
+from stock_pattern_model.session_utils import (
+    DEFAULT_REGULAR_SESSION_END,
+    DEFAULT_REGULAR_SESSION_START,
+    pattern_session_key_series,
+    session_date_series,
+    session_segment_series,
+)
 
 
 def _past_rolling_mean(

@@ -7,31 +7,31 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Any
-from typing import Protocol
+from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import yfinance as yf
 
 from stock_pattern_model.config import MarketDataConfig
-from stock_pattern_model.context import AnalysisContext
-from stock_pattern_model.context import build_analysis_context
-from stock_pattern_model.domain import DataQualityReport
-from stock_pattern_model.domain import MarketDataPayload
-from stock_pattern_model.exceptions import CacheError
-from stock_pattern_model.exceptions import DataValidationError
-from stock_pattern_model.exceptions import InvalidInstrumentError
-from stock_pattern_model.exceptions import MarketDataError
-from stock_pattern_model.exceptions import MissingDataFileError
-from stock_pattern_model.exceptions import MarketDataProviderError
-from stock_pattern_model.session_utils import DEFAULT_REGULAR_SESSION_END
-from stock_pattern_model.session_utils import DEFAULT_REGULAR_SESSION_START
-from stock_pattern_model.session_utils import allowed_session_mask
-from stock_pattern_model.session_utils import normalize_session_mode
-from stock_pattern_model.session_utils import session_mode_requires_extended_hours
-from stock_pattern_model.session_utils import session_date_series
-
+from stock_pattern_model.context import AnalysisContext, build_analysis_context
+from stock_pattern_model.domain import DataQualityReport, MarketDataPayload
+from stock_pattern_model.exceptions import (
+    CacheError,
+    DataValidationError,
+    InvalidInstrumentError,
+    MarketDataError,
+    MarketDataProviderError,
+    MissingDataFileError,
+)
+from stock_pattern_model.session_utils import (
+    DEFAULT_REGULAR_SESSION_END,
+    DEFAULT_REGULAR_SESSION_START,
+    allowed_session_mask,
+    normalize_session_mode,
+    session_date_series,
+    session_mode_requires_extended_hours,
+)
 
 LOGGER = logging.getLogger(__name__)
 REQUIRED_COLUMNS = ["Datetime", "Open", "High", "Low", "Close", "Volume"]
@@ -454,7 +454,7 @@ class YFinanceProvider:
                     interval=interval,
                     display_timezone=context.display_timezone if context is not None else "Asia/Jerusalem",
                     session_mode=effective_session_mode,
-                    instrument=None if context is None else None,
+                    instrument=context.instrument if context is not None else None,
                     provider="yfinance",
                     provider_metadata=metadata,
                     requested_period=period,
@@ -558,7 +558,7 @@ class YFinanceProvider:
             except Exception:  # noqa: BLE001
                 metadata["history_metadata"] = None
             return data, metadata
-        except Exception as error:  # noqa: BLE001
+        except Exception as error:
             raise MarketDataProviderError(
                 f"Yahoo Finance request failed for symbol '{symbol}'."
             ) from error

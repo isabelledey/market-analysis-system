@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import replace as dataclass_replace
 from typing import Protocol
 
 import numpy as np
 import pandas as pd
 
 from stock_pattern_model.config import PatternConfig
-from stock_pattern_model.domain import PatternEvent
-from stock_pattern_model.domain import PatternFamily
-from stock_pattern_model.domain import PatternStatus
+from stock_pattern_model.domain import PatternEvent, PatternFamily, PatternStatus
 from stock_pattern_model.session_utils import pattern_session_key_series
 
 
@@ -89,12 +88,103 @@ class _PriorPatternContext:
     swing_context: str
     quality_passed: bool
     reason: str
+    pattern_entry_trend: str = "Ambiguous"
+    pattern_entry_trend_score: float = 0.0
+
+
+_PATTERN_ENTRY_TREND_LABELS: dict[str, str] = {
+    "uptrend": "Uptrend",
+    "downtrend": "Downtrend",
+    "sideways": "Sideways",
+    "ambiguous": "Ambiguous",
+}
 
 
 def _context_direction_matches(direction: str, expected_direction: str | None) -> bool:
     if expected_direction is None:
         return direction in {"uptrend", "downtrend"}
     return direction == expected_direction
+
+
+def _recent_resistance_reference(
+    data: pd.DataFrame,
+    pattern_index: int,
+    lookback_bars: int,
+) -> float | None:
+    """Highest High in the causal prefix window: a proxy for a recent swing high / resistance area.
+
+    Excludes the pattern candle itself so a shooting star cannot "create" its own resistance.
+    """
+    start_index = max(0, pattern_index - lookback_bars)
+    window = data.iloc[start_index:pattern_index]
+    if window.empty:
+        return None
+    return float(window["High"].max())
+
+
+def _recent_support_reference(
+    data: pd.DataFrame,
+    pattern_index: int,
+    lookback_bars: int,
+) -> float | None:
+    """Lowest Low in the causal prefix window: a proxy for a recent swing low / support area.
+
+    Excludes the pattern candle itself, mirroring `_recent_resistance_reference`.
+    """
+    start_index = max(0, pattern_index - lookback_bars)
+    window = data.iloc[start_index:pattern_index]
+    if window.empty:
+        return None
+    return float(window["Low"].min())
+
+
+@dataclass(frozen=True)
+class _LowerWickRejectionOutcome:
+    context: _PriorPatternContext
+    near_support: bool
+    support_reference: float | None
+    classic_gate_passed: bool
+    context_validated_state: bool
+
+
+def _evaluate_lower_wick_rejection(
+    data: pd.DataFrame,
+    pattern_index: int,
+    row: pd.Series,
+    config: PatternConfig,
+) -> _LowerWickRejectionOutcome:
+    """Determine whether a lower-wick rejection candle enters the staged confirmation lifecycle.
+
+    `classic_gate_passed` mirrors the existing "genuine preceding downtrend" check (used for the
+    classic Hammer/Bullish Pin Bar name). `context_validated_state` is the broader, looser gate
+    described for Stage 4: near a recent low/support area OR a genuinely displaced preceding
+    downtrend -- either alone is enough to enter the state machine, even when the classic name
+    does not apply. The actual awaiting/directionally_confirmed/invalidated resolution is left to
+    `analysis._apply_generic_pattern_lifecycle`, which already forward-scans every tracked event
+    for retest/invalidation; Stage 4 extends that existing scan with a directional-confirmation
+    check rather than duplicating a second, inconsistent forward scan here.
+    """
+    context = classify_prior_pattern_context(
+        data,
+        pattern_index,
+        config,
+        expected_direction="downtrend",
+    )
+    support_reference = _recent_support_reference(data, pattern_index, config.resistance_proximity_lookback_bars)
+    candle_low = float(row["Low"])
+    near_support = (
+        support_reference is not None
+        and candle_low <= support_reference * (1.0 + config.support_resistance_proximity_tolerance)
+    )
+    context_validated_state = context.quality_passed or near_support
+
+    return _LowerWickRejectionOutcome(
+        context=context,
+        near_support=near_support,
+        support_reference=support_reference,
+        classic_gate_passed=context.quality_passed,
+        context_validated_state=context_validated_state,
+    )
 
 
 def _gap_tolerance(*ranges: float, ratio: float) -> float:
@@ -231,6 +321,11 @@ class BasePatternDetector:
         context_tags: tuple[str, ...] = (),
         context_bias: str = "Neutral",
         context_quality: str = "unknown",
+        pattern_entry_trend: str = "Not Applicable",
+        pattern_entry_trend_score: float = 0.0,
+        pattern_entry_trend_lookback_bars: int = 0,
+        rejection_confirmation_state: str = "not_applicable",
+        dampener_eligible: bool = False,
     ) -> PatternEvent:
         final_bar_index = final_index
         detected_bar_index = final_index if detected_at_index is None else detected_at_index
@@ -289,6 +384,11 @@ class BasePatternDetector:
             context_tags=context_tags,
             context_bias=context_bias,
             context_quality=context_quality,
+            pattern_entry_trend=pattern_entry_trend,
+            pattern_entry_trend_score=pattern_entry_trend_score,
+            pattern_entry_trend_lookback_bars=pattern_entry_trend_lookback_bars,
+            rejection_confirmation_state=rejection_confirmation_state,
+            dampener_eligible=dampener_eligible,
         )
 
 
@@ -405,70 +505,14 @@ class BullishPinBarDetector(BasePatternDetector):
         )
 
     def detect(self, data: pd.DataFrame, config: PatternConfig, interval: str) -> list[PatternEvent]:
-        events: list[PatternEvent] = []
-        for index, row in data.iterrows():
-            if not _long_lower_rejection_geometry(row):
-                continue
-
-            context = classify_prior_pattern_context(
-                data,
-                int(index),
-                config,
-                expected_direction="downtrend",
-            )
-            volume_source = str(row.get("Volume_Baseline_Source", "unknown"))
-            if context.quality_passed:
-                bias = "Bullish"
-                status = PatternStatus.CONFIRMED
-                context_quality = "validated"
-                detection_reason = (
-                    "A long lower wick and strong close matched bullish pin-bar geometry, and the "
-                    f"prefix-only prior context qualified as a downtrend ({context.reason}) with the "
-                    f"{volume_source} volume baseline."
-                )
-            else:
-                bias = "Neutral"
-                status = PatternStatus.CANDIDATE
-                context_quality = "geometry_only"
-                detection_reason = (
-                    "A long lower wick and strong close matched bullish pin-bar geometry, but the "
-                    f"prefix-only prior context did not qualify as a downtrend ({context.reason}), so "
-                    f"the candle remains a neutral geometry-only candidate with the {volume_source} "
-                    "volume baseline."
-                )
-            events.append(
-                self._build_event(
-                    data,
-                    interval,
-                    int(index),
-                    pattern_start_index=int(index),
-                    relevant_indices=[int(index)],
-                    relevant_prices={
-                        "open": float(row["Open"]),
-                        "high": float(row["High"]),
-                        "low": float(row["Low"]),
-                        "close": float(row["Close"]),
-                    },
-                    detection_reason=detection_reason,
-                    status=status,
-                    bias=bias,
-                    pattern_name=(
-                        "Bullish Pin Bar"
-                        if context.quality_passed
-                        else "Lower-Wick Rejection"
-                    ),
-                    geometry_label="long_lower_rejection",
-                    context_tags=(
-                        "single_candle",
-                        "bullish_rejection",
-                        "context_validated" if context.quality_passed else "geometry_first",
-                        f"prior_context_{context.direction}",
-                    ),
-                    context_bias="Bullish" if context.quality_passed else "Neutral",
-                    context_quality=context_quality,
-                )
-            )
-        return events
+        return _detect_lower_wick_rejection(
+            self,
+            data,
+            config,
+            interval,
+            classic_pattern_name="Bullish Pin Bar",
+            classic_geometry_phrase="bullish pin-bar geometry",
+        )
 
 
 class HammerDetector(BasePatternDetector):
@@ -484,52 +528,116 @@ class HammerDetector(BasePatternDetector):
         )
 
     def detect(self, data: pd.DataFrame, config: PatternConfig, interval: str) -> list[PatternEvent]:
-        events: list[PatternEvent] = []
-        for index, row in data.iterrows():
-            if not _long_lower_rejection_geometry(row):
-                continue
+        return _detect_lower_wick_rejection(
+            self,
+            data,
+            config,
+            interval,
+            classic_pattern_name="Hammer",
+            classic_geometry_phrase="hammer geometry",
+        )
 
-            context = classify_prior_pattern_context(
+
+def _detect_lower_wick_rejection(
+    detector: BasePatternDetector,
+    data: pd.DataFrame,
+    config: PatternConfig,
+    interval: str,
+    *,
+    classic_pattern_name: str,
+    classic_geometry_phrase: str,
+) -> list[PatternEvent]:
+    """Shared staged-confirmation detection for Hammer and Bullish Pin Bar.
+
+    Both detectors check the same geometry and the same backward context; they only differ in
+    what the classic (context-validated) name is. Detection only resolves the backward-looking
+    half of the state machine (`detected` vs `context_validated`); the forward-looking half
+    (awaiting directional confirmation, directionally confirmed, or invalidated) is resolved by
+    `analysis._apply_generic_pattern_lifecycle`, which re-scans forward on every analysis run --
+    unlike a one-shot detector, it can discover confirmation/invalidation that occurred well after
+    the original detection.
+    """
+    events: list[PatternEvent] = []
+    for index, row in data.iterrows():
+        if not _long_lower_rejection_geometry(row):
+            continue
+
+        pattern_index = int(index)
+        outcome = _evaluate_lower_wick_rejection(data, pattern_index, row, config)
+        volume_source = str(row.get("Volume_Baseline_Source", "unknown"))
+        context = outcome.context
+
+        if not outcome.context_validated_state:
+            bias = "Neutral"
+            status = PatternStatus.CANDIDATE
+            pattern_name = "Lower-Wick Rejection"
+            context_quality = "geometry_only"
+            dampener_eligible = False
+            rejection_confirmation_state = "detected"
+            detection_reason = (
+                f"A long lower wick and strong close matched {classic_geometry_phrase}, but the "
+                f"prefix-only prior context did not qualify as a downtrend and the candle was not "
+                f"near a recent support area ({context.reason}), so it remains a neutral "
+                f"geometry-only candidate with the {volume_source} volume baseline."
+            )
+        else:
+            bias = "Bullish"
+            status = PatternStatus.TENTATIVE
+            dampener_eligible = True
+            rejection_confirmation_state = "context_validated"
+            pattern_name = classic_pattern_name if outcome.classic_gate_passed else "Lower-Wick Rejection"
+            context_quality = "validated" if outcome.classic_gate_passed else "geometry_only"
+            context_basis = (
+                f"a qualifying prefix-only downtrend ({context.reason})"
+                if outcome.classic_gate_passed
+                else f"proximity to a recent support level ({outcome.support_reference:.2f})"
+            )
+            detection_reason = (
+                f"A long lower wick and strong close matched {classic_geometry_phrase} after "
+                f"{context_basis}. A later close above the rejection candle's high would "
+                "directionally confirm the reversal; a close below its low would invalidate it. "
+                "Until then this stays a bounded, unconfirmed bullish signal."
+            )
+
+        relevant_prices = {
+            "open": float(row["Open"]),
+            "high": float(row["High"]),
+            "low": float(row["Low"]),
+            "close": float(row["Close"]),
+        }
+        if outcome.support_reference is not None:
+            relevant_prices["support_reference"] = outcome.support_reference
+
+        events.append(
+            detector._build_event(
                 data,
-                int(index),
-                config,
-                expected_direction="downtrend",
+                interval,
+                pattern_index,
+                pattern_start_index=pattern_index,
+                relevant_indices=[pattern_index],
+                relevant_prices=relevant_prices,
+                detection_reason=detection_reason,
+                status=status,
+                bias=bias,
+                pattern_name=pattern_name,
+                geometry_label="long_lower_rejection",
+                context_tags=(
+                    "single_candle",
+                    "bullish_rejection",
+                    "context_validated" if outcome.classic_gate_passed else "geometry_first",
+                    f"prior_context_{context.direction}",
+                    f"rejection_state_{rejection_confirmation_state}",
+                ),
+                context_bias="Bullish" if bias == "Bullish" else "Neutral",
+                context_quality=context_quality,
+                pattern_entry_trend=context.pattern_entry_trend,
+                pattern_entry_trend_score=context.pattern_entry_trend_score,
+                pattern_entry_trend_lookback_bars=context.lookback_bars,
+                rejection_confirmation_state=rejection_confirmation_state,
+                dampener_eligible=dampener_eligible,
             )
-            if not context.quality_passed:
-                continue
-
-            volume_source = str(row.get("Volume_Baseline_Source", "unknown"))
-            events.append(
-                self._build_event(
-                    data,
-                    interval,
-                    int(index),
-                    pattern_start_index=int(index),
-                    relevant_indices=[int(index)],
-                    relevant_prices={
-                        "open": float(row["Open"]),
-                        "high": float(row["High"]),
-                        "low": float(row["Low"]),
-                        "close": float(row["Close"]),
-                    },
-                    detection_reason=(
-                        "A hammer formed after a qualifying prefix-only downtrend: the small body "
-                        "met the configured tolerance, the lower wick showed bullish rejection, "
-                        f"and the prior context passed validation ({context.reason}) with the "
-                        f"{volume_source} volume baseline."
-                    ),
-                    geometry_label="long_lower_rejection",
-                    context_tags=(
-                        "single_candle",
-                        "bullish_rejection",
-                        "downtrend_context",
-                        f"prior_context_{context.direction}",
-                    ),
-                    context_bias="Bullish",
-                    context_quality="validated",
-                )
-            )
-        return events
+        )
+    return events
 
 
 class ShootingStarDetector(BasePatternDetector):
@@ -550,62 +658,141 @@ class ShootingStarDetector(BasePatternDetector):
             if not _long_upper_rejection_geometry(row):
                 continue
 
+            pattern_index = int(index)
             context = classify_prior_pattern_context(
                 data,
-                int(index),
+                pattern_index,
                 config,
                 expected_direction="uptrend",
             )
             volume_source = str(row.get("Volume_Baseline_Source", "unknown"))
-            if context.quality_passed:
+
+            resistance_reference = _recent_resistance_reference(
+                data,
+                pattern_index,
+                config.resistance_proximity_lookback_bars,
+            )
+            candle_high = float(row["High"])
+            near_resistance = (
+                resistance_reference is not None
+                and candle_high >= resistance_reference * (1.0 - config.support_resistance_proximity_tolerance)
+            )
+            local_trend_before_candle = (
+                str(data.iloc[pattern_index - 1].get("Local_Trend", "Neutral"))
+                if pattern_index > 0
+                else "Neutral"
+            )
+            contradicted_by_local_trend = local_trend_before_candle == "Downtrend"
+
+            # A classic Shooting Star requires all three: a genuine, sufficiently displaced
+            # preceding uptrend (context.quality_passed); the rejection occurring at/above a
+            # recent swing high or resistance level (near_resistance); and no contradictory
+            # local-session downtrend already in force heading into the candle.
+            classic_shooting_star = (
+                context.quality_passed and near_resistance and not contradicted_by_local_trend
+            )
+
+            resistance_note = (
+                f"price ({candle_high:.2f}) was near the recent {resistance_reference:.2f} "
+                "swing-high/resistance level"
+                if resistance_reference is not None
+                else "no recent swing-high/resistance level could be established"
+            )
+
+            if classic_shooting_star:
+                pattern_name = "Shooting Star"
                 bias = "Bearish"
-                status = PatternStatus.CONFIRMED
+                status = PatternStatus.TENTATIVE
                 context_quality = "validated"
+                role_tag = "shooting_star"
                 detection_reason = (
-                    "A long upper wick and weak close matched shooting-star geometry, and the "
-                    f"prefix-only prior context qualified as an uptrend ({context.reason}) with the "
-                    f"{volume_source} volume baseline."
+                    "A long upper wick and weak close matched shooting-star geometry, the "
+                    f"prefix-only prior context qualified as a genuine uptrend ({context.reason}), "
+                    f"{resistance_note}, and no contradictory local downtrend was present. A later "
+                    "close below the rejection candle's low would directionally confirm the "
+                    "reversal; a close above its high would invalidate it. Until then this stays a "
+                    "bounded, unconfirmed bearish signal."
                 )
-            else:
+            elif contradicted_by_local_trend:
+                pattern_name = "Upper-Wick Rejection"
+                bias = "Bearish"
+                status = PatternStatus.TENTATIVE
+                context_quality = "geometry_only"
+                role_tag = "bearish_continuation_rejection"
+                detection_reason = (
+                    "A long upper wick and weak close matched shooting-star geometry, but the local "
+                    "session trend was already a downtrend heading into the candle, so this is a "
+                    "bearish upper-wick rejection during a short-term decline rather than a reversal "
+                    f"from a genuine uptrend ({context.reason}). A later close below the rejection "
+                    "candle's low would directionally confirm continued weakness; until then this "
+                    f"stays a bounded, unconfirmed bearish signal, with the {volume_source} volume "
+                    "baseline."
+                )
+            elif near_resistance:
+                pattern_name = "Resistance Rejection"
                 bias = "Neutral"
                 status = PatternStatus.CANDIDATE
                 context_quality = "geometry_only"
+                role_tag = "resistance_rejection"
+                detection_reason = (
+                    f"A long upper wick and weak close matched shooting-star geometry and {resistance_note}, "
+                    f"but the preceding move did not qualify as a genuine uptrend ({context.reason}), so this "
+                    f"is a resistance-zone rejection rather than a classic shooting star, with the "
+                    f"{volume_source} volume baseline."
+                )
+            else:
+                pattern_name = "Upper-Wick Rejection"
+                bias = "Neutral"
+                status = PatternStatus.CANDIDATE
+                context_quality = "geometry_only"
+                role_tag = "geometry_first"
                 detection_reason = (
                     "A long upper wick and weak close matched shooting-star geometry, but the "
-                    f"prefix-only prior context did not qualify as an uptrend ({context.reason}), so "
-                    f"the candle remains a neutral geometry-only candidate with the {volume_source} "
-                    "volume baseline."
+                    f"prefix-only prior context did not qualify as an uptrend near resistance "
+                    f"({context.reason}; {resistance_note}), so the candle remains a neutral "
+                    f"geometry-only candidate with the {volume_source} volume baseline."
                 )
+
+            relevant_prices = {
+                "open": float(row["Open"]),
+                "high": float(row["High"]),
+                "low": float(row["Low"]),
+                "close": float(row["Close"]),
+            }
+            if resistance_reference is not None:
+                relevant_prices["resistance_reference"] = resistance_reference
+
+            dampener_eligible = bias == "Bearish"
+            rejection_confirmation_state = "context_validated" if dampener_eligible else "detected"
+
             events.append(
                 self._build_event(
                     data,
                     interval,
-                    int(index),
-                    pattern_start_index=int(index),
-                    relevant_indices=[int(index)],
-                    relevant_prices={
-                        "open": float(row["Open"]),
-                        "high": float(row["High"]),
-                        "low": float(row["Low"]),
-                        "close": float(row["Close"]),
-                    },
+                    pattern_index,
+                    pattern_start_index=pattern_index,
+                    relevant_indices=[pattern_index],
+                    relevant_prices=relevant_prices,
                     detection_reason=detection_reason,
                     status=status,
                     bias=bias,
-                    pattern_name=(
-                        "Shooting Star"
-                        if context.quality_passed
-                        else "Upper-Wick Rejection"
-                    ),
+                    pattern_name=pattern_name,
                     geometry_label="long_upper_rejection",
                     context_tags=(
                         "single_candle",
                         "bearish_rejection",
-                        "context_validated" if context.quality_passed else "geometry_first",
                         f"prior_context_{context.direction}",
+                        f"local_trend_{local_trend_before_candle.lower()}",
+                        "near_resistance" if near_resistance else "away_from_resistance",
+                        role_tag,
                     ),
-                    context_bias="Bearish" if context.quality_passed else "Neutral",
+                    context_bias="Bearish" if bias == "Bearish" else "Neutral",
                     context_quality=context_quality,
+                    pattern_entry_trend=context.pattern_entry_trend,
+                    pattern_entry_trend_score=context.pattern_entry_trend_score,
+                    pattern_entry_trend_lookback_bars=context.lookback_bars,
+                    rejection_confirmation_state=rejection_confirmation_state,
+                    dampener_eligible=dampener_eligible,
                 )
             )
         return events
@@ -776,7 +963,6 @@ class BreakoutDetector(BasePatternDetector):
             ):
                 continue
             current_tolerance = _price_tolerance_from_row(row, float(current_reference), config)
-            previous_tolerance = _price_tolerance_from_row(previous_row, float(previous_reference), config)
             crossed = (
                 float(row["Close"]) > float(current_reference)
                 and float(previous_row["Close"]) <= float(previous_reference)
@@ -869,7 +1055,6 @@ class BreakdownDetector(BasePatternDetector):
             ):
                 continue
             current_tolerance = _price_tolerance_from_row(row, float(current_reference), config)
-            previous_tolerance = _price_tolerance_from_row(previous_row, float(previous_reference), config)
             crossed = (
                 float(row["Close"]) < float(current_reference)
                 and float(previous_row["Close"]) >= float(previous_reference)
@@ -1016,6 +1201,7 @@ class MorningStarDetector(BasePatternDetector):
                         "first_close": float(first["Close"]),
                         "star_open": float(second["Open"]),
                         "star_close": float(second["Close"]),
+                        "star_low": float(second["Low"]),
                         "recovery_close": float(third["Close"]),
                         "midpoint": midpoint,
                     },
@@ -1079,6 +1265,7 @@ class EveningStarDetector(BasePatternDetector):
                         "first_close": float(first["Close"]),
                         "star_open": float(second["Open"]),
                         "star_close": float(second["Close"]),
+                        "star_high": float(second["High"]),
                         "reversal_close": float(third["Close"]),
                         "midpoint": midpoint,
                     },
@@ -1479,7 +1666,7 @@ class PatternRegistry:
 
     detectors: tuple[PatternDetector, ...]
 
-    def register(self, detector: PatternDetector) -> "PatternRegistry":
+    def register(self, detector: PatternDetector) -> PatternRegistry:
         return PatternRegistry(detectors=self.detectors + (detector,))
 
     def detect(self, data: pd.DataFrame, config: PatternConfig, interval: str) -> list[PatternEvent]:
@@ -1595,20 +1782,15 @@ def classify_prior_pattern_context(
             swing_context="insufficient_history",
             quality_passed=False,
             reason="fewer than 8 completed bars existed before the pattern candle",
+            pattern_entry_trend="Ambiguous",
+            pattern_entry_trend_score=0.0,
         )
 
-    short_horizon, _, _ = _trend_horizons(max(config.breakout_lookback, 12))
-    lookback_bars = min(len(prefix), max(12, short_horizon))
+    lookback_bars = min(len(prefix), max(8, config.pattern_entry_trend_lookback_bars))
     window = prefix.tail(lookback_bars).reset_index(drop=True)
     closes = window["Close"].astype(float).to_numpy(copy=False)
     highs = window["High"].astype(float).to_numpy(copy=False)
     lows = window["Low"].astype(float).to_numpy(copy=False)
-    returns = (
-        window.get("Bar_Return", pd.Series(closes).pct_change())
-        .fillna(0.0)
-        .astype(float)
-        .to_numpy()
-    )
 
     atr_scale = float(np.nanmean(highs - lows))
     atr_scale = atr_scale if atr_scale > 1e-9 else max(abs(float(closes[-1])) * 0.001, 1e-6)
@@ -1650,11 +1832,12 @@ def classify_prior_pattern_context(
         breakout_lookback=config.breakout_lookback,
     )
 
-    if snapshot.label == "Uptrend" and atr_normalized_move >= 1.25:
+    minimum_displacement = config.context_minimum_displacement_atr
+    if snapshot.label == "Uptrend" and atr_normalized_move >= minimum_displacement:
         direction = "uptrend"
-    elif snapshot.label == "Downtrend" and atr_normalized_move <= -1.25:
+    elif snapshot.label == "Downtrend" and atr_normalized_move <= -minimum_displacement:
         direction = "downtrend"
-    elif abs(snapshot.score) >= 16.0 and abs(atr_normalized_move) >= 1.0:
+    elif abs(snapshot.score) >= 16.0 and abs(atr_normalized_move) >= minimum_displacement * 0.8:
         direction = "uptrend" if snapshot.score > 0 else "downtrend"
     elif abs(snapshot.score) >= 10.0:
         direction = "sideways"
@@ -1665,7 +1848,7 @@ def classify_prior_pattern_context(
         _context_direction_matches(direction, expected_direction)
         and abs(snapshot.score) >= 18.0
         and abs(regression_score) >= 6.0
-        and abs(atr_normalized_move) >= 1.25
+        and abs(atr_normalized_move) >= minimum_displacement
     )
     reason = (
         f"{direction} context over {lookback_bars} prior bars "
@@ -1682,6 +1865,8 @@ def classify_prior_pattern_context(
         swing_context=swing_context,
         quality_passed=quality_passed,
         reason=reason,
+        pattern_entry_trend=_PATTERN_ENTRY_TREND_LABELS.get(direction, "Ambiguous"),
+        pattern_entry_trend_score=round(snapshot.score, 2),
     )
 
 
@@ -2082,8 +2267,6 @@ def classify_intraday_trend(
     high_values = pattern_df["High"].astype(float).to_numpy(copy=False)
     low_values = pattern_df["Low"].astype(float).to_numpy(copy=False)
     return_values = pattern_df["Bar_Return"].fillna(0.0).astype(float).to_numpy()
-    bullish_values = pattern_df.get("Is_Bullish", pd.Series(False, index=pattern_df.index)).fillna(False).astype(bool).to_numpy()
-    bearish_values = pattern_df.get("Is_Bearish", pd.Series(False, index=pattern_df.index)).fillna(False).astype(bool).to_numpy()
     break_scores = _prefix_break_structure_scores(
         pattern_df,
         breakout_lookback=breakout_lookback,
@@ -2102,7 +2285,10 @@ def classify_intraday_trend(
     trend_lookbacks: list[int] = []
 
     for index in range(len(pattern_df)):
-        def build_snapshot(horizon: int) -> _TrendSnapshot:
+        def build_snapshot(horizon: int, index: int = index) -> _TrendSnapshot:
+            # `index` is bound as a default argument (not read from the enclosing loop) so this
+            # closure can never accidentally capture a later iteration's value if it were ever
+            # stored and called outside its own loop iteration.
             start_index = max(0, index - horizon + 1)
             break_score = float(break_scores[index]) * (1.0 if horizon <= 60 else 0.5)
             return _trend_snapshot_from_arrays(
@@ -2200,6 +2386,112 @@ def classify_intraday_trend(
     return pattern_df
 
 
+def classify_local_session_trend(
+    df: pd.DataFrame,
+    *,
+    lookback_bars: int = 20,
+    pivot_left_bars: int = 2,
+    pivot_right_bars: int = 2,
+) -> pd.DataFrame:
+    """Classify a session-anchored local trend, independent of the broad multi-horizon trend.
+
+    Unlike ``classify_intraday_trend`` (a weighted blend of short/medium/long horizons that can
+    stay "Uptrend" on the strength of older history), this evaluates only the current session,
+    capped to ``lookback_bars``, so a sharp intraday reversal is never masked by a bullish broad
+    trend. It combines: (1) the same slope/moving-average/persistence/swing-structure evidence used
+    for the broad trend, scoped to the local window; (2) cumulative return from the session open,
+    ATR-normalized; and (3) the candle's position within the session's high/low range so far.
+    """
+    pattern_df = df.copy()
+    close_values = pattern_df["Close"].astype(float).to_numpy(copy=False)
+    high_values = pattern_df["High"].astype(float).to_numpy(copy=False)
+    low_values = pattern_df["Low"].astype(float).to_numpy(copy=False)
+    return_values = pattern_df["Bar_Return"].fillna(0.0).astype(float).to_numpy()
+    session_open_values = pattern_df["Session_Open"].astype(float).to_numpy(copy=False)
+    session_high_values = pattern_df["Session_High"].astype(float).to_numpy(copy=False)
+    session_low_values = pattern_df["Session_Low"].astype(float).to_numpy(copy=False)
+    session_position = pattern_df.groupby("Session_Date", sort=False).cumcount().to_numpy()
+
+    labels: list[str] = []
+    scores: list[float] = []
+    evidence_all: list[list[str]] = []
+    lookbacks: list[int] = []
+
+    for index in range(len(pattern_df)):
+        window_len = min(lookback_bars, int(session_position[index]) + 1)
+        start_index = index - window_len + 1
+
+        structure_snapshot = _trend_snapshot_from_arrays(
+            close_values[start_index : index + 1],
+            high_values[start_index : index + 1],
+            low_values[start_index : index + 1],
+            return_values[start_index : index + 1],
+            horizon=window_len,
+            pivot_left_bars=pivot_left_bars,
+            pivot_right_bars=pivot_right_bars,
+            breakout_lookback=window_len,
+            raw_break_score=0.0,
+            horizon_label="Local Session",
+        )
+
+        close = float(close_values[index])
+        session_open = float(session_open_values[index])
+        session_high = float(session_high_values[index])
+        session_low = float(session_low_values[index])
+        window_highs = high_values[start_index : index + 1]
+        window_lows = low_values[start_index : index + 1]
+        atr_scale = float(np.nanmean(window_highs - window_lows))
+        atr_scale = atr_scale if atr_scale > 1e-9 else max(abs(close) * 0.001, 1e-6)
+
+        # Internal scoring weights (not user-facing config): scaled to sit on the same -100..100
+        # composite scale as the structural snapshot above and the broad trend's own components
+        # (_trend_snapshot_from_arrays), so the three additive terms below are comparable in
+        # magnitude. Only the *lookback* is a tunable knob (local_trend_lookback_bars); these
+        # weights are fixed, matching how the broad trend's own slope/MA/persistence weights are
+        # fixed constants rather than configuration.
+        cumulative_return_atr = (close - session_open) / atr_scale if session_open else 0.0
+        cumulative_return_score = float(np.clip(cumulative_return_atr * 6.0, -22.0, 22.0))
+
+        session_range = session_high - session_low
+        range_position = (close - session_low) / session_range if session_range > 1e-9 else 0.5
+        range_position_score = (range_position - 0.5) * 2.0 * 12.0
+
+        evidence: list[str] = list(structure_snapshot.evidence)
+        if abs(cumulative_return_score) >= 6.0:
+            direction_word = "Bullish" if cumulative_return_score > 0 else "Bearish"
+            evidence.append(
+                f"[Local Session, {direction_word}] Cumulative return from the session open was "
+                f"{'positive' if cumulative_return_score > 0 else 'negative'} "
+                f"({cumulative_return_atr:.2f} ATR)."
+            )
+        if abs(range_position_score) >= 6.0:
+            direction_word = "Bullish" if range_position_score > 0 else "Bearish"
+            evidence.append(
+                f"[Local Session, {direction_word}] Price was trading near the session "
+                f"{'high' if range_position_score > 0 else 'low'} "
+                f"({range_position * 100:.0f}% of the session range so far)."
+            )
+
+        raw_score = structure_snapshot.score + cumulative_return_score + range_position_score
+        score = float(np.clip(raw_score, -100.0, 100.0))
+        label = _trend_label(score)
+        if not evidence:
+            evidence = [
+                "Slope, session position, and swing structure were too mixed to confirm a local trend."
+            ]
+
+        labels.append(label)
+        scores.append(round(score, 2))
+        evidence_all.append(evidence)
+        lookbacks.append(window_len)
+
+    pattern_df["Local_Trend"] = labels
+    pattern_df["Local_Trend_Score"] = scores
+    pattern_df["Local_Trend_Evidence"] = evidence_all
+    pattern_df["Local_Trend_Lookback_Bars"] = lookbacks
+    return pattern_df
+
+
 def resolve_pattern_conflicts(
     raw_patterns: list[PatternEvent],
 ) -> tuple[list[PatternEvent], int]:
@@ -2229,3 +2521,160 @@ def resolve_pattern_conflicts(
         ),
     )
     return resolved_patterns, ignored_patterns_count
+
+
+_STRUCTURAL_PATTERN_IDS = {"double_top", "double_bottom"}
+
+
+def _structural_canonical_key(event: PatternEvent) -> tuple[object, ...]:
+    """Identity for "the same underlying structural setup at the same lifecycle stage".
+
+    `setup_completion_at` is tied to a specific bar index (the second confirmed swing), so it is
+    an exact, discrete anchor -- not something that needs float tolerance -- and is what a double
+    top/bottom detector's own duplication bug shares across near-duplicate detections (multiple
+    qualifying earlier swings all pairing with the same later swing and peak). `confirmation_at`
+    and `status` distinguish genuinely different lifecycle moments (tentative vs. confirmed vs.
+    failed vs. expired) of that same setup, which must never be collapsed into one another.
+    """
+    setup_completion = event.setup_completion_at or event.pattern_end_at
+    confirmation = event.confirmation_at
+    return (
+        event.pattern_id,
+        event.bias,
+        setup_completion.isoformat(),
+        confirmation.isoformat() if confirmation is not None else None,
+        event.status.value,
+    )
+
+
+def _prices_within_tolerance(
+    prices_a: dict[str, float],
+    prices_b: dict[str, float],
+    *,
+    ratio: float,
+) -> bool:
+    shared_keys = set(prices_a) & set(prices_b)
+    if not shared_keys:
+        return True
+    for key in shared_keys:
+        value_a = float(prices_a[key])
+        value_b = float(prices_b[key])
+        reference = max(abs(value_a), abs(value_b), 1e-9)
+        if abs(value_a - value_b) / reference > ratio:
+            return False
+    return True
+
+
+def _cluster_events_by_price_tolerance(
+    events: list[PatternEvent],
+    *,
+    ratio: float,
+) -> list[list[PatternEvent]]:
+    clusters: list[list[PatternEvent]] = []
+    for event in events:
+        placed = False
+        for cluster in clusters:
+            if _prices_within_tolerance(cluster[0].relevant_prices, event.relevant_prices, ratio=ratio):
+                cluster.append(event)
+                placed = True
+                break
+        if not placed:
+            clusters.append([event])
+    return clusters
+
+
+def _select_structural_representative(cluster: list[PatternEvent]) -> PatternEvent:
+    """Deterministic tie-break, independent of input order: prefer the strongest signal (deepest
+    valley / tallest peak, already captured in `signal_strength`), then the earliest-forming
+    (widest) pairing, then the lowest pattern_start_index as a final, fully deterministic tie-break.
+    """
+    ranked = sorted(
+        cluster,
+        key=lambda event: (
+            -event.signal_strength,
+            event.pattern_start_at,
+            event.pattern_start_index if event.pattern_start_index is not None else min(event.relevant_indices),
+        ),
+    )
+    representative = ranked[0]
+    if len(cluster) == 1:
+        return representative
+
+    other_starts = sorted(
+        {
+            event.pattern_start_at.isoformat()
+            for event in cluster
+            if event is not representative
+        }
+    )
+    merged_reason = (
+        f"{representative.detection_reason} This setup was also independently detected from "
+        f"{len(cluster) - 1} other qualifying earlier swing pairing(s) starting at "
+        f"{', '.join(other_starts)}; these near-duplicate detections were merged into this one "
+        "canonical event."
+    )
+    merged_indices = sorted({index for event in cluster for index in event.relevant_indices})
+    return dataclass_replace(
+        representative,
+        detection_reason=merged_reason,
+        relevant_indices=merged_indices,
+    )
+
+
+def deduplicate_structural_events(
+    events: list[PatternEvent],
+    *,
+    price_tolerance_ratio: float = 0.005,
+) -> tuple[list[PatternEvent], int]:
+    """Merge near-duplicate structural (multi-pivot) pattern events.
+
+    Double Top/Bottom detectors pair every qualifying earlier swing with the nearest valid later
+    swing; when more than one earlier swing qualifies against the same later swing and peak, this
+    produces multiple near-identical events for what is really one underlying setup (same
+    timestamps, status, and price levels, modulo tiny float differences). This runs immediately
+    after `resolve_pattern_conflicts`, before events are prepared, tracked, or scored, so downstream
+    layers never see the duplicate.
+
+    Deterministic and idempotent: grouping is keyed purely by each event's own canonical identity
+    and price levels (never by input position), and the representative choice is a fixed, content-
+    based tie-break -- shuffling the input never changes which events survive, and re-running this
+    on an already-deduplicated list is a no-op. Distinct setups (different `setup_completion_at`,
+    different lifecycle stage, or prices outside tolerance) are never merged.
+    """
+    grouped: dict[tuple[object, ...], list[PatternEvent]] = {}
+    for event in events:
+        if event.pattern_id not in _STRUCTURAL_PATTERN_IDS:
+            continue
+        grouped.setdefault(_structural_canonical_key(event), []).append(event)
+
+    representative_by_id: dict[int, PatternEvent] = {}
+    removed_count = 0
+    for candidates in grouped.values():
+        for cluster in _cluster_events_by_price_tolerance(candidates, ratio=price_tolerance_ratio):
+            representative = _select_structural_representative(cluster)
+            for event in cluster:
+                representative_by_id[id(event)] = representative
+            removed_count += len(cluster) - 1
+
+    deduplicated: list[PatternEvent] = []
+    seen_representative_ids: set[int] = set()
+    for event in events:
+        if event.pattern_id not in _STRUCTURAL_PATTERN_IDS:
+            deduplicated.append(event)
+            continue
+        representative = representative_by_id[id(event)]
+        representative_key = id(representative)
+        if representative_key in seen_representative_ids:
+            continue
+        seen_representative_ids.add(representative_key)
+        deduplicated.append(representative)
+
+    deduplicated.sort(
+        key=lambda item: (
+            item.detected_at,
+            item.pattern_start_at,
+            item.pattern_name,
+            item.status.value,
+        )
+    )
+    return deduplicated, removed_count

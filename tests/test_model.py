@@ -190,7 +190,10 @@ def test_all_patterns_are_returned_while_top_patterns_remain_limited() -> None:
     as_of = pd.Timestamp("2026-07-10 19:31", tz=EXCHANGE_TZ)
     result = analyze_dataframe(df=df, symbol="TEST", as_of=as_of)
 
-    assert len(result["all_detected_patterns"]) == 4
+    # Each of the 4 candles now yields both a Bullish Pin Bar and a Hammer "Lower-Wick Rejection"
+    # candidate: Stage 4 removed Hammer's old asymmetry of silently dropping non-validated
+    # geometry instead of emitting a geometry-only candidate like Bullish Pin Bar already did.
+    assert len(result["all_detected_patterns"]) == 8
     assert len(result["top_patterns"]) == 3
     assert result["top_patterns"][0]["pattern_name"] == "Lower-Wick Rejection"
     assert result["top_patterns"][0]["detector_label"] == "Bullish Pin Bar"

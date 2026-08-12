@@ -4,33 +4,38 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import replace
-from statistics import mean
-from statistics import median
+from statistics import mean, median
 from typing import Any
 
 import pandas as pd
 
 from stock_pattern_model.analysis import analyze_dataframe
-from stock_pattern_model.config import HistoricalEvaluationConfig
-from stock_pattern_model.config import MarketDataConfig
+from stock_pattern_model.config import HistoricalEvaluationConfig, MarketDataConfig
 from stock_pattern_model.context import build_analysis_context
-from stock_pattern_model.domain import DataQualityReport
-from stock_pattern_model.domain import HistoricalEvaluationResult
-from stock_pattern_model.domain import HistoricalPerformanceSummary
-from stock_pattern_model.domain import HistoricalSignalOutcome
-from stock_pattern_model.domain import HistoricalSignalRecord
-from stock_pattern_model.domain import ResolvedInstrument
+from stock_pattern_model.domain import (
+    DataQualityReport,
+    HistoricalEvaluationResult,
+    HistoricalPerformanceSummary,
+    HistoricalSignalOutcome,
+    HistoricalSignalRecord,
+    ResolvedInstrument,
+)
 from stock_pattern_model.exceptions import DataValidationError
-from stock_pattern_model.market_data import FileDataProvider
-from stock_pattern_model.market_data import MarketDataProvider
-from stock_pattern_model.market_data import YFinanceProvider
-from stock_pattern_model.market_data import validate_market_data
-from stock_pattern_model.pattern_detector import DEFAULT_PATTERN_REGISTRY
-from stock_pattern_model.pattern_detector import PatternRegistry
-from stock_pattern_model.session_utils import DEFAULT_REGULAR_SESSION_END
-from stock_pattern_model.session_utils import DEFAULT_REGULAR_SESSION_START
-from stock_pattern_model.session_utils import DEFAULT_SESSION_MODE
-from stock_pattern_model.session_utils import session_segment_series
+from stock_pattern_model.market_data import (
+    FileDataProvider,
+    MarketDataProvider,
+    YFinanceProvider,
+    validate_market_data,
+)
+from stock_pattern_model.pattern_detector import (
+    DEFAULT_PATTERN_REGISTRY,
+    PatternRegistry,
+)
+from stock_pattern_model.session_utils import (
+    DEFAULT_REGULAR_SESSION_END,
+    DEFAULT_REGULAR_SESSION_START,
+    session_segment_series,
+)
 
 
 def _get_bar_timedelta(interval: str) -> pd.Timedelta:

@@ -252,7 +252,10 @@ def test_additional_pattern_detectors_emit_expected_events() -> None:
     shooting_star_df.loc[24, ["Open", "High", "Low", "Close", "Volume"]] = [100.2, 101.5, 100.1, 100.3, 2600]
     shooting_star_events = ShootingStarDetector().detect(add_features(shooting_star_df), PatternConfig(), "15m")
     assert len(shooting_star_events) == 1
-    assert shooting_star_events[0].pattern_name == "Upper-Wick Rejection"
+    # The rejection candle breaks well above the flat prior range, so it registers as a
+    # resistance-zone rejection (Stage 2 contextual classification) rather than a generic
+    # geometry-only candidate.
+    assert shooting_star_events[0].pattern_name == "Resistance Rejection"
     assert shooting_star_events[0].bias == "Neutral"
     assert shooting_star_events[0].status is PatternStatus.CANDIDATE
     assert shooting_star_events[0].geometry_label == "long_upper_rejection"
@@ -296,7 +299,10 @@ def test_single_candle_rejection_patterns_expose_geometry_and_context_metadata()
     assert pin_events
     assert hammer_events[0].geometry_label == "long_lower_rejection"
     assert hammer_events[0].context_quality == "validated"
-    assert "downtrend_context" in hammer_events[0].context_tags
+    # Hammer and Bullish Pin Bar now share the same staged-confirmation detection code (Stage 4),
+    # so they share the same "context_validated" tag convention instead of Hammer's old,
+    # detector-specific "downtrend_context" tag.
+    assert "context_validated" in hammer_events[0].context_tags
     assert pin_events[0].geometry_label == "long_lower_rejection"
     assert pin_events[0].context_quality == "geometry_only"
     assert "geometry_first" in pin_events[0].context_tags
@@ -373,7 +379,10 @@ def test_long_rejection_geometry_resolves_differently_by_prior_context() -> None
     assert downtrend_event.bias == "Neutral"
     assert downtrend_event.status is PatternStatus.CANDIDATE
 
-    assert sideways_event.pattern_name == "Upper-Wick Rejection"
+    # The rejection candle breaks well above the recent sideways range, so it is treated as a
+    # resistance-zone rejection rather than a generic geometry-only candidate (Stage 2: contextual
+    # shooting-star classification also checks proximity to a recent swing high / resistance area).
+    assert sideways_event.pattern_name == "Resistance Rejection"
     assert sideways_event.bias == "Neutral"
     assert sideways_event.context_quality == "geometry_only"
 
