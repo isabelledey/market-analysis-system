@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from stock_pattern_model.analysis import _build_final_assessment
 from stock_pattern_model.analysis import analyze_dataframe
 from stock_pattern_model.config import ScoringConfig
 from stock_pattern_model.domain import DataQualityReport
@@ -333,6 +334,50 @@ def test_pattern_anchored_in_prior_session_does_not_score_in_new_session() -> No
     assert result["score"]["bearish_score"] == 0
 
 
+def test_daily_interval_pattern_from_prior_bar_is_not_excluded_for_session_mismatch() -> None:
+    # Regression for the PYPL Aug-18/Aug-19 case: for daily/weekly intervals every bar is its
+    # own calendar-day "session", so the intraday same-session-date rule above would wrongly
+    # exclude every pattern except one from the single latest bar, no matter how recent. The
+    # bar-index age check (candles_ago / max_age_bars) is what should govern eligibility here.
+    service = ScoringService(ScoringConfig())
+    patterns = [
+        make_pattern_record(
+            event=make_event(
+                pattern_id="bearish_engulfing",
+                pattern_name="Bearish Engulfing",
+                pattern_family=PatternFamily.ENGULFING,
+                bias="Bearish",
+                detected_at="2026-08-18",
+                pattern_start_at="2026-08-18",
+                pattern_end_at="2026-08-18",
+                bar_start_at="2026-08-18",
+                bar_end_at="2026-08-18",
+            ),
+            candles_ago=1,
+            event_state="active",
+            extra_fields={
+                "last_completed_candle_at": pd.Timestamp("2026-08-19", tz=EXCHANGE_TZ),
+            },
+        ),
+    ]
+
+    result = service.evaluate(
+        symbol="PYPL",
+        trend="Uptrend",
+        patterns=patterns,
+        quality_report=make_quality_report(),
+        latest_close=61.25,
+        latest_bar_start_display="2026-08-19 07:00 Asia/Jerusalem",
+        latest_bar_end_display="2026-08-20 07:00 Asia/Jerusalem",
+        interval="1d",
+        latest_volume_baseline_source="time_of_day",
+    )
+
+    pattern_result = result["patterns"][0]
+    assert pattern_result["score_eligibility"]["reason"] != "outside current trading session"
+    assert pattern_result["score_eligible"] is True
+
+
 def test_breakout_uses_family_specific_horizon_instead_of_global_four_bar_expiry() -> None:
     service = ScoringService(
         ScoringConfig(
@@ -647,3 +692,135 @@ def test_analysis_result_is_json_serializable() -> None:
 
     assert '"structured_explanation"' in serialized
     assert '"volume_score"' in serialized
+
+
+def test_final_assessment_is_neutral_with_no_confirmed_patterns() -> None:
+    df = make_base_df()
+    result = analyze_dataframe(df=df, symbol="TEST", as_of=pd.Timestamp("2026-07-10 17:01", tz=EXCHANGE_TZ))
+
+    assessment = result["final_assessment"]
+    assert assessment["recommendation"] == "NEUTRAL"
+    assert assessment["confidence_level"] in {"LOW", "MEDIUM", "HIGH"}
+    assert isinstance(assessment["bullish_signals"], list)
+    assert isinstance(assessment["bearish_signals"], list)
+    assert assessment["disclaimer"] == (
+        "This assessment is based on technical analysis of the available data and is not "
+        "financial advice."
+    )
+
+
+def _base_explanation(**overrides: object) -> dict[str, object]:
+    explanation: dict[str, object] = {
+        "bullish_evidence": [],
+        "bearish_evidence": [],
+        "current_display_summary": {"directional_conflict_present": False},
+    }
+    explanation.update(overrides)
+    return explanation
+
+
+def test_final_assessment_recommends_buy_when_bias_and_trend_agree() -> None:
+    assessment = _build_final_assessment(
+        overall_bias="Bullish",
+        rule_confidence=65.0,
+        trend="Uptrend",
+        trend_structure_score=40.0,
+        local_trend="Uptrend",
+        local_trend_score=30.0,
+        net_signal_score=15.0,
+        structured_explanation=_base_explanation(bullish_evidence=["Bullish Engulfing confirmed."]),
+    )
+
+    assert assessment["recommendation"] == "RECOMMEND TO BUY"
+    assert assessment["confidence_level"] == "HIGH"
+    assert any("Uptrend" in signal for signal in assessment["bullish_signals"])
+
+
+def test_final_assessment_recommends_not_recommended_when_bias_and_trend_agree() -> None:
+    assessment = _build_final_assessment(
+        overall_bias="Bearish",
+        rule_confidence=65.0,
+        trend="Downtrend",
+        trend_structure_score=-40.0,
+        local_trend="Downtrend",
+        local_trend_score=-30.0,
+        net_signal_score=-15.0,
+        structured_explanation=_base_explanation(bearish_evidence=["Bearish Engulfing confirmed."]),
+    )
+
+    assert assessment["recommendation"] == "NOT RECOMMENDED"
+    assert assessment["confidence_level"] == "HIGH"
+    assert any("Downtrend" in signal for signal in assessment["bearish_signals"])
+
+
+def test_final_assessment_downgrades_to_neutral_on_directional_conflict() -> None:
+    assessment = _build_final_assessment(
+        overall_bias="Bullish",
+        rule_confidence=65.0,
+        trend="Uptrend",
+        trend_structure_score=40.0,
+        local_trend="Uptrend",
+        local_trend_score=30.0,
+        net_signal_score=15.0,
+        structured_explanation=_base_explanation(
+            bullish_evidence=["Bullish Engulfing confirmed."],
+            bearish_evidence=["Shooting Star confirmed."],
+            current_display_summary={"directional_conflict_present": True},
+        ),
+    )
+
+    assert assessment["recommendation"] == "NEUTRAL"
+    assert "both currently contributing" in assessment["reasoning"]
+
+
+def test_final_assessment_downgrades_to_neutral_when_trend_opposes_bias() -> None:
+    assessment = _build_final_assessment(
+        overall_bias="Bullish",
+        rule_confidence=65.0,
+        trend="Downtrend",
+        trend_structure_score=-20.0,
+        local_trend="Uptrend",
+        local_trend_score=10.0,
+        net_signal_score=15.0,
+        structured_explanation=_base_explanation(bullish_evidence=["Bullish Engulfing confirmed."]),
+    )
+
+    assert assessment["recommendation"] == "NEUTRAL"
+    assert "opposing" in assessment["reasoning"]
+
+
+def test_final_assessment_confidence_level_buckets() -> None:
+    low = _build_final_assessment(
+        overall_bias="Neutral",
+        rule_confidence=10.0,
+        trend="Neutral",
+        trend_structure_score=None,
+        local_trend=None,
+        local_trend_score=None,
+        net_signal_score=0.0,
+        structured_explanation=_base_explanation(),
+    )
+    medium = _build_final_assessment(
+        overall_bias="Neutral",
+        rule_confidence=40.0,
+        trend="Neutral",
+        trend_structure_score=None,
+        local_trend=None,
+        local_trend_score=None,
+        net_signal_score=0.0,
+        structured_explanation=_base_explanation(),
+    )
+    high = _build_final_assessment(
+        overall_bias="Bullish",
+        rule_confidence=80.0,
+        trend="Uptrend",
+        trend_structure_score=40.0,
+        local_trend="Uptrend",
+        local_trend_score=30.0,
+        net_signal_score=15.0,
+        structured_explanation=_base_explanation(bullish_evidence=["Bullish Engulfing confirmed."]),
+    )
+
+    assert low["confidence_level"] == "LOW"
+    assert medium["confidence_level"] == "MEDIUM"
+    assert high["confidence_level"] == "HIGH"

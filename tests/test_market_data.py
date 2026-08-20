@@ -8,6 +8,7 @@ import pytest
 
 from stock_pattern_model.analysis import analyze_dataframe
 from stock_pattern_model.analysis import analyze_stock
+from stock_pattern_model.datetime_utils import interval_to_timedelta
 from stock_pattern_model.features import add_features
 from stock_pattern_model.market_data import FileDataProvider
 from stock_pattern_model.market_data import YFinanceProvider
@@ -124,6 +125,36 @@ def test_invalid_ohlc_rejection(tmp_path: Path) -> None:
             exchange_timezone="America/New_York",
             strict_data=True,
         )
+
+
+def test_interval_to_timedelta_handles_yfinance_style_tokens() -> None:
+    # pandas' own Timedelta parser rejects "wk" and has no unit for calendar
+    # months at all, so these yfinance-style tokens need explicit aliasing.
+    assert interval_to_timedelta("1wk") == pd.Timedelta(days=7)
+    assert interval_to_timedelta("1mo") == pd.Timedelta(days=30)
+    assert interval_to_timedelta("3mo") == pd.Timedelta(days=90)
+    assert interval_to_timedelta("15m") == pd.Timedelta(minutes=15)
+    assert interval_to_timedelta("1d") == pd.Timedelta(days=1)
+
+
+@pytest.mark.parametrize("interval", ["1wk", "1mo", "3mo"])
+def test_completed_row_count_with_yfinance_style_intervals_does_not_raise(
+    interval: str,
+) -> None:
+    # Regression test: validate_market_data used to crash with
+    # "ValueError: invalid unit abbreviation" for these SUPPORTED_INTERVALS
+    # values whenever as_of triggered the completed-row-count computation.
+    df = make_df(length=5)
+    far_future_as_of = pd.Timestamp("2030-01-01", tz=EXCHANGE_TZ)
+
+    _, report = validate_market_data(
+        df,
+        interval=interval,
+        as_of=far_future_as_of,
+        strict_data=True,
+    )
+
+    assert report.completed_row_count == len(df)
 
 
 def test_duplicate_timestamp_reporting() -> None:

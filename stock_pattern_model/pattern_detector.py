@@ -10,12 +10,13 @@ import numpy as np
 import pandas as pd
 
 from stock_pattern_model.config import PatternConfig
+from stock_pattern_model.datetime_utils import interval_to_timedelta
 from stock_pattern_model.domain import PatternEvent, PatternFamily, PatternStatus
 from stock_pattern_model.session_utils import pattern_session_key_series
 
 
 def _get_bar_timedelta(interval: str) -> pd.Timedelta:
-    return pd.to_timedelta(interval)
+    return interval_to_timedelta(interval)
 
 
 def _get_bar_end(timestamp: pd.Timestamp, interval: str) -> pd.Timestamp:
@@ -69,6 +70,68 @@ def _long_upper_rejection_geometry(row: pd.Series) -> bool:
         and close_location <= 0.40
         and bool(row["Is_Significant_Candle"])
     )
+
+
+_LATEST_CANDLE_DIRECTION_LABELS = (
+    "Strong Bullish",
+    "Bullish",
+    "Neutral",
+    "Bearish",
+    "Strong Bearish",
+)
+
+
+def classify_latest_candle_direction(row: pd.Series) -> tuple[str, float]:
+    """Classify a single candle's own shape and direction: body size, candle range, wick
+    sizes, and close position only.
+
+    This is deliberately single-candle and must never be confused with a multi-candle trend
+    (Trend / Local_Trend). It answers "how bullish or bearish did this one candle look", not
+    "what has price been doing across recent candles" -- those are two different questions
+    that were previously conflated when Local_Trend silently collapsed to one bar for
+    daily/weekly intervals (see classify_local_session_trend).
+    """
+    candle_range = row.get("Candle_Range")
+    if candle_range is None or pd.isna(candle_range) or float(candle_range) <= 0:
+        return "Neutral", 0.0
+
+    open_price = float(row["Open"])
+    close_price = float(row["Close"])
+    low_price = float(row["Low"])
+    body_ratio = float(row["Body_Ratio"])
+    upper_wick_ratio = float(row["Upper_Wick_Ratio"])
+    lower_wick_ratio = float(row["Lower_Wick_Ratio"])
+    close_location = (close_price - low_price) / float(candle_range)
+
+    if close_price > open_price:
+        directional_magnitude = body_ratio
+    elif close_price < open_price:
+        directional_magnitude = -body_ratio
+    else:
+        directional_magnitude = 0.0
+
+    close_position_component = (close_location - 0.5) * 2.0
+    wick_asymmetry = lower_wick_ratio - upper_wick_ratio
+
+    # Fixed weights (not user-facing config), matching how the candlestick geometry gates
+    # elsewhere in this module use fixed constants: body direction dominates (0.5), close
+    # position within the range is next (0.3), and wick asymmetry provides a smaller
+    # tempering signal (0.2) so a long wick against the candle's own direction pulls a
+    # large-bodied candle back toward Neutral rather than being ignored.
+    score = (0.5 * directional_magnitude) + (0.3 * close_position_component) + (0.2 * wick_asymmetry)
+    score = max(-1.0, min(1.0, score))
+
+    if score >= 0.6:
+        label = "Strong Bullish"
+    elif score >= 0.2:
+        label = "Bullish"
+    elif score <= -0.6:
+        label = "Strong Bearish"
+    elif score <= -0.2:
+        label = "Bearish"
+    else:
+        label = "Neutral"
+    return label, round(score, 4)
 
 
 def _doji_geometry(row: pd.Series, config: PatternConfig) -> bool:
@@ -2389,28 +2452,42 @@ def classify_intraday_trend(
 def classify_local_session_trend(
     df: pd.DataFrame,
     *,
+    interval: str,
     lookback_bars: int = 20,
     pivot_left_bars: int = 2,
     pivot_right_bars: int = 2,
 ) -> pd.DataFrame:
-    """Classify a session-anchored local trend, independent of the broad multi-horizon trend.
+    """Classify a local trend over a recent multi-candle window, independent of the broad
+    multi-horizon trend.
 
     Unlike ``classify_intraday_trend`` (a weighted blend of short/medium/long horizons that can
-    stay "Uptrend" on the strength of older history), this evaluates only the current session,
-    capped to ``lookback_bars``, so a sharp intraday reversal is never masked by a bullish broad
-    trend. It combines: (1) the same slope/moving-average/persistence/swing-structure evidence used
-    for the broad trend, scoped to the local window; (2) cumulative return from the session open,
-    ATR-normalized; and (3) the candle's position within the session's high/low range so far.
+    stay "Uptrend" on the strength of older history), this evaluates only a recent window capped
+    to ``lookback_bars``, so a sharp reversal is never masked by a bullish broad trend. It
+    combines: (1) the same slope/moving-average/persistence/swing-structure evidence used for the
+    broad trend, scoped to the local window; (2) cumulative return from the start of that window,
+    ATR-normalized; and (3) the candle's position within the window's high/low range.
+
+    For intraday intervals the window is anchored to the current exchange session (calendar day),
+    capped to ``lookback_bars`` -- a session can contain many bars, so this stays a genuine
+    multi-candle read. For daily/weekly intervals, each bar *is* its own calendar-day "session"
+    (Session_Date is unique per row), so anchoring to the session would collapse the window to a
+    single bar on every candle -- silently reducing a "local trend" to that one candle's own
+    shape. To avoid that, daily/weekly intervals instead use a rolling window of the last
+    ``lookback_bars`` completed candles, unrelated to session boundaries.
     """
     pattern_df = df.copy()
     close_values = pattern_df["Close"].astype(float).to_numpy(copy=False)
     high_values = pattern_df["High"].astype(float).to_numpy(copy=False)
     low_values = pattern_df["Low"].astype(float).to_numpy(copy=False)
+    open_values = pattern_df["Open"].astype(float).to_numpy(copy=False)
     return_values = pattern_df["Bar_Return"].fillna(0.0).astype(float).to_numpy()
-    session_open_values = pattern_df["Session_Open"].astype(float).to_numpy(copy=False)
-    session_high_values = pattern_df["Session_High"].astype(float).to_numpy(copy=False)
-    session_low_values = pattern_df["Session_Low"].astype(float).to_numpy(copy=False)
-    session_position = pattern_df.groupby("Session_Date", sort=False).cumcount().to_numpy()
+
+    is_intraday = interval_to_timedelta(interval) < pd.Timedelta(days=1)
+    if is_intraday:
+        session_open_values = pattern_df["Session_Open"].astype(float).to_numpy(copy=False)
+        session_high_values = pattern_df["Session_High"].astype(float).to_numpy(copy=False)
+        session_low_values = pattern_df["Session_Low"].astype(float).to_numpy(copy=False)
+        session_position = pattern_df.groupby("Session_Date", sort=False).cumcount().to_numpy()
 
     labels: list[str] = []
     scores: list[float] = []
@@ -2418,8 +2495,21 @@ def classify_local_session_trend(
     lookbacks: list[int] = []
 
     for index in range(len(pattern_df)):
-        window_len = min(lookback_bars, int(session_position[index]) + 1)
-        start_index = index - window_len + 1
+        if is_intraday:
+            window_len = min(lookback_bars, int(session_position[index]) + 1)
+            start_index = index - window_len + 1
+            window_open = float(session_open_values[index])
+            window_high = float(session_high_values[index])
+            window_low = float(session_low_values[index])
+            horizon_label = "Local Session"
+        else:
+            # Rolling multi-candle window over the last completed bars, not the calendar session.
+            window_len = min(lookback_bars, index + 1)
+            start_index = index - window_len + 1
+            window_open = float(open_values[start_index])
+            window_high = float(np.max(high_values[start_index : index + 1]))
+            window_low = float(np.min(low_values[start_index : index + 1]))
+            horizon_label = "Local Window"
 
         structure_snapshot = _trend_snapshot_from_arrays(
             close_values[start_index : index + 1],
@@ -2431,13 +2521,10 @@ def classify_local_session_trend(
             pivot_right_bars=pivot_right_bars,
             breakout_lookback=window_len,
             raw_break_score=0.0,
-            horizon_label="Local Session",
+            horizon_label=horizon_label,
         )
 
         close = float(close_values[index])
-        session_open = float(session_open_values[index])
-        session_high = float(session_high_values[index])
-        session_low = float(session_low_values[index])
         window_highs = high_values[start_index : index + 1]
         window_lows = low_values[start_index : index + 1]
         atr_scale = float(np.nanmean(window_highs - window_lows))
@@ -2449,27 +2536,27 @@ def classify_local_session_trend(
         # magnitude. Only the *lookback* is a tunable knob (local_trend_lookback_bars); these
         # weights are fixed, matching how the broad trend's own slope/MA/persistence weights are
         # fixed constants rather than configuration.
-        cumulative_return_atr = (close - session_open) / atr_scale if session_open else 0.0
+        cumulative_return_atr = (close - window_open) / atr_scale if window_open else 0.0
         cumulative_return_score = float(np.clip(cumulative_return_atr * 6.0, -22.0, 22.0))
 
-        session_range = session_high - session_low
-        range_position = (close - session_low) / session_range if session_range > 1e-9 else 0.5
+        window_range = window_high - window_low
+        range_position = (close - window_low) / window_range if window_range > 1e-9 else 0.5
         range_position_score = (range_position - 0.5) * 2.0 * 12.0
 
         evidence: list[str] = list(structure_snapshot.evidence)
         if abs(cumulative_return_score) >= 6.0:
             direction_word = "Bullish" if cumulative_return_score > 0 else "Bearish"
             evidence.append(
-                f"[Local Session, {direction_word}] Cumulative return from the session open was "
-                f"{'positive' if cumulative_return_score > 0 else 'negative'} "
+                f"[{horizon_label}, {direction_word}] Cumulative return from the start of the "
+                f"local window was {'positive' if cumulative_return_score > 0 else 'negative'} "
                 f"({cumulative_return_atr:.2f} ATR)."
             )
         if abs(range_position_score) >= 6.0:
             direction_word = "Bullish" if range_position_score > 0 else "Bearish"
             evidence.append(
-                f"[Local Session, {direction_word}] Price was trading near the session "
+                f"[{horizon_label}, {direction_word}] Price was trading near the local window "
                 f"{'high' if range_position_score > 0 else 'low'} "
-                f"({range_position * 100:.0f}% of the session range so far)."
+                f"({range_position * 100:.0f}% of the window range)."
             )
 
         raw_score = structure_snapshot.score + cumulative_return_score + range_position_score
@@ -2477,7 +2564,7 @@ def classify_local_session_trend(
         label = _trend_label(score)
         if not evidence:
             evidence = [
-                "Slope, session position, and swing structure were too mixed to confirm a local trend."
+                "Slope, window position, and swing structure were too mixed to confirm a local trend."
             ]
 
         labels.append(label)

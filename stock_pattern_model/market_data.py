@@ -15,6 +15,7 @@ import yfinance as yf
 
 from stock_pattern_model.config import MarketDataConfig
 from stock_pattern_model.context import AnalysisContext, build_analysis_context
+from stock_pattern_model.datetime_utils import interval_to_timedelta
 from stock_pattern_model.domain import DataQualityReport, MarketDataPayload
 from stock_pattern_model.exceptions import (
     CacheError,
@@ -120,7 +121,7 @@ def _localize_datetime_series(
 
 def _is_intraday_interval(interval: str) -> bool:
     try:
-        return pd.to_timedelta(interval) < pd.Timedelta(days=1)
+        return interval_to_timedelta(interval) < pd.Timedelta(days=1)
     except ValueError:
         return False
 
@@ -134,7 +135,7 @@ def _count_irregular_gaps(
     if len(datetimes) < 2 or not _is_intraday_interval(interval):
         return 0
 
-    expected_gap = pd.to_timedelta(interval)
+    expected_gap = interval_to_timedelta(interval)
     gap_count = 0
     previous = datetimes.shift(1)
     previous_session_dates = session_dates.shift(1)
@@ -278,7 +279,7 @@ def validate_market_data(
         if normalized_as_of.tzinfo is None:
             raise DataValidationError("as_of must be timezone-aware.")
         completed_row_count = int(
-            (validated_df["Datetime"] + pd.to_timedelta(interval) <= normalized_as_of).sum()
+            (validated_df["Datetime"] + interval_to_timedelta(interval) <= normalized_as_of).sum()
         )
 
     report = DataQualityReport(

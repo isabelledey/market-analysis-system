@@ -21,6 +21,7 @@ from stock_pattern_model.datetime_utils import (
     convert_to_timezone,
     format_display_datetime,
     format_iso_timestamp,
+    interval_to_timedelta,
 )
 from stock_pattern_model.domain import (
     DataQualityReport,
@@ -40,6 +41,7 @@ from stock_pattern_model.pattern_detector import (
     DEFAULT_PATTERN_REGISTRY,
     PatternRegistry,
     classify_intraday_trend,
+    classify_latest_candle_direction,
     classify_local_session_trend,
     deduplicate_structural_events,
     detect_patterns,
@@ -74,7 +76,7 @@ def _get_recency_weight(candles_ago: int) -> float:
 
 
 def _get_bar_timedelta(interval: str) -> pd.Timedelta:
-    return pd.to_timedelta(interval)
+    return interval_to_timedelta(interval)
 
 
 def _get_bar_end(timestamp: pd.Timestamp, interval: str) -> pd.Timestamp:
@@ -164,6 +166,7 @@ def _run_pattern_pipeline(
     )
     pattern_df = classify_local_session_trend(
         pattern_df,
+        interval=config.interval,
         lookback_bars=config.pattern.local_trend_lookback_bars,
         pivot_left_bars=config.pattern.pivot_left_bars,
         pivot_right_bars=config.pattern.pivot_right_bars,
@@ -981,6 +984,51 @@ def _invalidation_condition_text(
     return None
 
 
+def _pattern_candle_summary(
+    event: PatternEvent,
+    df: pd.DataFrame,
+    display_timezone,
+) -> dict[str, Any] | None:
+    """Original OHLC (and derived geometry ratios) for the candle this event is anchored to,
+    read directly from the source DataFrame by index -- not from relevant_prices, so this is
+    an independent cross-check of which candle a pattern actually refers to.
+
+    Uses the last of ``relevant_indices`` (the candle whose close completed/confirmed the
+    pattern), which for single-candle patterns like Shooting Star is that candle itself.
+    """
+    if not event.relevant_indices:
+        return None
+    anchor_index = int(event.relevant_indices[-1])
+    if anchor_index < 0 or anchor_index >= len(df):
+        return None
+    row = df.iloc[anchor_index]
+    open_price = float(row["Open"])
+    high_price = float(row["High"])
+    low_price = float(row["Low"])
+    close_price = float(row["Close"])
+    candle_range = high_price - low_price
+    if candle_range > 1e-9:
+        body_ratio = abs(close_price - open_price) / candle_range
+        upper_wick_ratio = (high_price - max(open_price, close_price)) / candle_range
+        lower_wick_ratio = (min(open_price, close_price) - low_price) / candle_range
+        close_location = (close_price - low_price) / candle_range
+    else:
+        body_ratio = upper_wick_ratio = lower_wick_ratio = 0.0
+        close_location = 0.5
+    return {
+        "index": anchor_index,
+        "timestamp": format_display_datetime(pd.Timestamp(row["Datetime"]), display_timezone),
+        "open": open_price,
+        "high": high_price,
+        "low": low_price,
+        "close": close_price,
+        "body_ratio": round(body_ratio, 4),
+        "upper_wick_ratio": round(upper_wick_ratio, 4),
+        "lower_wick_ratio": round(lower_wick_ratio, 4),
+        "close_location": round(close_location, 4),
+    }
+
+
 def _build_canonical_event_groups(
     patterns: list[dict[str, Any]],
     *,
@@ -1102,6 +1150,7 @@ def _build_canonical_event_groups(
                 "included_in_current_score": included_in_current_score,
                 "score_eligible": bool(primary.get("score_eligible", False)),
                 "exclusion_reason": inclusion_reason,
+                "pattern_candle": _pattern_candle_summary(event, df, display_timezone),
                 "geometry_label": event.geometry_label,
                 "context_tags": list(event.context_tags),
                 "context_bias": event.context_bias,
@@ -1510,6 +1559,137 @@ def _build_explanation_sections(
     return enriched
 
 
+def _build_final_assessment(
+    *,
+    overall_bias: str,
+    rule_confidence: float,
+    trend: str,
+    trend_structure_score: float | None,
+    local_trend: str | None,
+    local_trend_score: float | None,
+    net_signal_score: float,
+    structured_explanation: dict[str, Any],
+) -> dict[str, Any]:
+    """Combine the already-computed trend, pattern, and bias signals into one final
+    technical-analysis label.
+
+    This adds no new indicators -- it only weighs and summarizes signals the rest of the
+    analysis already produced (overall_bias, rule_confidence, trend, local_trend,
+    net_signal_score, and the bullish/bearish evidence lines). overall_bias is the base
+    signal (it already combines confirmed-pattern evidence with recency/volume/trend
+    context and is already gated on rule_confidence -- see ScoringService._derive_overall_bias
+    and the minimum_bias_confidence gate around it), so it is not re-derived here. Only two
+    additional, genuinely independent cross-checks are applied on top of it: whether bullish
+    and bearish evidence are both currently contributing to the score, and whether the broad
+    trend disagrees with the bias/local trend -- neither of which factors into overall_bias
+    itself (see ScoringService._derive_overall_bias, which never reads `trend`).
+    """
+    bullish_pattern_lines = list(structured_explanation.get("bullish_evidence", []))
+    bearish_pattern_lines = list(structured_explanation.get("bearish_evidence", []))
+    display_summary = structured_explanation.get("current_display_summary", {})
+    directional_conflict_present = bool(display_summary.get("directional_conflict_present"))
+    trend_diverges = bool(
+        local_trend
+        and trend in {"Uptrend", "Downtrend"}
+        and local_trend in {"Uptrend", "Downtrend"}
+        and local_trend != trend
+    )
+
+    bullish_signals: list[str] = []
+    bearish_signals: list[str] = []
+
+    if trend == "Uptrend":
+        suffix = f" (score {trend_structure_score:.2f})" if trend_structure_score is not None else ""
+        bullish_signals.append(f"Broad trend is Uptrend{suffix}.")
+    elif trend == "Downtrend":
+        suffix = f" (score {trend_structure_score:.2f})" if trend_structure_score is not None else ""
+        bearish_signals.append(f"Broad trend is Downtrend{suffix}.")
+
+    if local_trend == "Uptrend":
+        suffix = f" (score {local_trend_score:.2f})" if local_trend_score is not None else ""
+        bullish_signals.append(f"Local session trend is Uptrend{suffix}.")
+    elif local_trend == "Downtrend":
+        suffix = f" (score {local_trend_score:.2f})" if local_trend_score is not None else ""
+        bearish_signals.append(f"Local session trend is Downtrend{suffix}.")
+
+    bullish_signals.extend(bullish_pattern_lines)
+    bearish_signals.extend(bearish_pattern_lines)
+
+    if net_signal_score > 0:
+        bullish_signals.append(f"Net signal score is positive ({net_signal_score:.2f}).")
+    elif net_signal_score < 0:
+        bearish_signals.append(f"Net signal score is negative ({net_signal_score:.2f}).")
+
+    if overall_bias == "Bullish":
+        recommendation = "RECOMMEND TO BUY"
+    elif overall_bias == "Bearish":
+        recommendation = "NOT RECOMMENDED"
+    else:
+        recommendation = "NEUTRAL"
+
+    downgrade_reasons: list[str] = []
+    if recommendation != "NEUTRAL":
+        if directional_conflict_present:
+            downgrade_reasons.append("bullish and bearish evidence are both currently contributing to the score")
+        if recommendation == "RECOMMEND TO BUY" and trend == "Downtrend":
+            downgrade_reasons.append("the broader trend is Downtrend, opposing the bias")
+        if recommendation == "NOT RECOMMENDED" and trend == "Uptrend":
+            downgrade_reasons.append("the broader trend is Uptrend, opposing the bias")
+        if trend_diverges:
+            downgrade_reasons.append(
+                f"the broad trend ({trend}) and local session trend ({local_trend}) disagree"
+            )
+        if downgrade_reasons:
+            recommendation = "NEUTRAL"
+
+    if rule_confidence >= 60.0:
+        confidence_level = "HIGH"
+    elif rule_confidence >= 30.0:
+        confidence_level = "MEDIUM"
+    else:
+        confidence_level = "LOW"
+    if downgrade_reasons and confidence_level == "HIGH":
+        # A downgraded, mixed read is inherently less certain than the raw rule-confidence
+        # number alone would suggest.
+        confidence_level = "MEDIUM"
+
+    if recommendation == "RECOMMEND TO BUY":
+        reasoning = (
+            f"Overall bias is Bullish with {rule_confidence:.1f}/100 rule confidence, broad "
+            f"trend is {trend}, and {len(bullish_pattern_lines)} confirmed bullish pattern(s) "
+            f"outweighed {len(bearish_pattern_lines)} bearish."
+        )
+    elif recommendation == "NOT RECOMMENDED":
+        reasoning = (
+            f"Overall bias is Bearish with {rule_confidence:.1f}/100 rule confidence, broad "
+            f"trend is {trend}, and {len(bearish_pattern_lines)} confirmed bearish pattern(s) "
+            f"outweighed {len(bullish_pattern_lines)} bullish."
+        )
+    elif downgrade_reasons:
+        reasoning = (
+            f"Overall bias was {overall_bias}, but the read was downgraded to Neutral because "
+            + "; ".join(downgrade_reasons) + "."
+        )
+    else:
+        reasoning = (
+            f"Signals were mixed or insufficient for a directional call: overall bias is "
+            f"{overall_bias}, broad trend is {trend}, with {len(bullish_pattern_lines)} bullish "
+            f"and {len(bearish_pattern_lines)} bearish confirmed pattern(s)."
+        )
+
+    return {
+        "recommendation": recommendation,
+        "confidence_level": confidence_level,
+        "reasoning": reasoning,
+        "bullish_signals": bullish_signals,
+        "bearish_signals": bearish_signals,
+        "disclaimer": (
+            "This assessment is based on technical analysis of the available data and is not "
+            "financial advice."
+        ),
+    }
+
+
 def _serialize_pattern_event(
     pattern: dict[str, Any],
     display_timezone,
@@ -1617,6 +1797,7 @@ def _serialize_pattern_event(
         "strength_label": pattern["strength_label"],
         "volume_baseline_source": pattern["volume_baseline_source"],
         "detector_label": pattern.get("detector_label", event.pattern_name),
+        "pattern_candle": _pattern_candle_summary(event, df, display_timezone),
         "geometry_label": event.geometry_label,
         "context_tags": list(event.context_tags),
         "context_bias": event.context_bias,
@@ -1959,6 +2140,7 @@ def analyze_dataframe(
     local_trend_lookback_bars = int(
         latest_row.get("Local_Trend_Lookback_Bars", config.pattern.local_trend_lookback_bars)
     )
+    latest_candle_direction, latest_candle_direction_score = classify_latest_candle_direction(latest_row)
     session_info = _latest_completed_session_info(pattern_df, interval, context=context)
     resolved_events, ignored_patterns_count = resolve_pattern_conflicts(raw_events)
     resolved_events, duplicate_structural_count = deduplicate_structural_events(
@@ -2049,6 +2231,16 @@ def analyze_dataframe(
         explanation += " Session context: " + " ".join(structured_explanation["session_context"])
     if structured_explanation.get("lifecycle_note"):
         explanation += " Lifecycle note: " + structured_explanation["lifecycle_note"]
+    final_assessment = _build_final_assessment(
+        overall_bias=overall_bias,
+        rule_confidence=rule_confidence,
+        trend=trend,
+        trend_structure_score=trend_structure_score,
+        local_trend=local_trend,
+        local_trend_score=local_trend_score,
+        net_signal_score=score["net_signal_score"],
+        structured_explanation=structured_explanation,
+    )
     all_detected_patterns = [
         _serialize_pattern_event(
             pattern,
@@ -2118,6 +2310,8 @@ def analyze_dataframe(
         "local_trend_score": local_trend_score,
         "local_trend_evidence": local_trend_evidence,
         "local_trend_lookback_bars": local_trend_lookback_bars,
+        "latest_candle_direction": latest_candle_direction,
+        "latest_candle_direction_score": latest_candle_direction_score,
         "short_term_trend": str(latest_row.get("Short_Term_Trend", trend)),
         "medium_term_trend": str(latest_row.get("Medium_Term_Trend", trend)),
         "long_term_trend": str(latest_row.get("Long_Term_Trend", trend)),
@@ -2163,6 +2357,7 @@ def analyze_dataframe(
         "market_data_metadata": metadata or {},
         "structured_explanation": structured_explanation,
         "explanation": explanation,
+        "final_assessment": final_assessment,
     }
 
 

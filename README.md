@@ -100,6 +100,16 @@ python3 -m stock_pattern_model analyze AAPL
 python3 main.py AAPL
 ```
 
+`--ticker` is equivalent to the positional identifier, for callers that prefer
+named flags:
+
+```bash
+python3 main.py --ticker AAPL --timeframe 3_MONTHS
+```
+
+Providing both the positional identifier and `--ticker` at the same time is a
+configuration error.
+
 Exchange-qualified tickers are preserved:
 
 ```bash
@@ -172,7 +182,115 @@ Provide an explicit `as_of`:
 python3 -m stock_pattern_model analyze AAPL --as-of 2026-07-10T16:46:00-04:00
 ```
 
-Empty interactive input is rejected with a nonzero exit code. The CLI never falls back to a hardcoded default symbol or batch list.
+Choose a preset analysis timeframe instead of manual `--period`/`--interval`:
+
+```bash
+python3 -m stock_pattern_model analyze AAPL --timeframe 3_MONTHS
+```
+
+`--timeframe` automatically selects a matching period and interval:
+
+| Timeframe   | Period | Interval |
+|-------------|--------|----------|
+| `1_DAY`     | `1d`   | `15m`    |
+| `1_WEEK`    | `5d`   | `15m`    |
+| `1_MONTH`   | `1mo`  | `1h`     |
+| `3_MONTHS`  | `3mo`  | `1d`     |
+| `6_MONTHS`  | `6mo`  | `1d`     |
+| `1_YEAR`    | `1y`   | `1d`     |
+| `5_YEARS`   | `5y`   | `1wk`    |
+
+`--timeframe` cannot be combined with `--period` or `--interval`; doing so raises a
+configuration error. Combine `--timeframe` with `--as-of` to look back to a past
+point in time (for example, running analysis every evening for testing).
+
+If `--timeframe`, `--period`, and `--interval` are all omitted, the CLI prompts
+you to choose one of the seven timeframe presets by number instead of silently
+defaulting to `1mo`/`15m`:
+
+```text
+Enter a ticker or Israeli security number:
+Choose a timeframe:
+
+1) One day
+2) One week
+3) One month
+4) Three months
+5) Six months
+6) One year
+7) Five years
+
+Enter your choice (1-7):
+```
+
+Entering a number outside 1-7, non-numeric text, or an empty value prints an
+error and re-shows the menu; it never crashes or exits the program. A valid
+selection echoes both the readable label and the internal value it maps to,
+for example `Selected timeframe: Three months (3_MONTHS)`. This numbered menu
+is interactive-only and has no effect on `--timeframe`, which still takes the
+internal value directly (`--timeframe 3_MONTHS`) for scripted/CLI usage.
+
+This means plain, no-flag invocations always prompt for both the instrument and
+the timeframe:
+
+```bash
+python3 main.py
+python3 -m stock_pattern_model analyze
+```
+
+The prompt fires unconditionally on any omitted timeframe, the same as the
+existing ticker prompt — it does not depend on detecting a real terminal, so it
+also appears in consoles that don't report themselves as an interactive tty
+(for example, PyCharm's default Run window).
+
+Scripts and scheduled jobs that must never block on input should pass
+`--no-interactive` (which keeps the `1mo`/`15m` default) alongside an explicit
+ticker, or supply `--timeframe`/`--period`/`--interval` directly:
+
+```bash
+python3 -m stock_pattern_model analyze AAPL --no-interactive
+python3 -m stock_pattern_model analyze AAPL --timeframe 3_MONTHS
+```
+
+```bash
+python3 -m stock_pattern_model analyze AAPL --timeframe 6_MONTHS --as-of 2026-08-14T23:59:00+03:00
+```
+
+### Ticker Validation
+
+An interactively entered ticker, company name, or Israeli security number is
+resolved and then confirmed against live market data before the timeframe menu
+appears. Anything that doesn't resolve to a real, existing security -- empty
+input, an unresolvable symbol/company name, an unknown security number, or a
+provider failure -- prints:
+
+```text
+Error: No matching stock was found. Please enter the ticker, company name, or security number again.
+```
+
+and re-prompts:
+
+```text
+Enter a ticker or Israeli security number:
+```
+
+This repeats until a valid security is entered; it never crashes and never
+falls back to a hardcoded default symbol or batch list. A resolved instrument
+is only accepted once a small live fetch confirms it actually has price
+data -- resolution succeeding on its own (string/CSV normalization) is not
+enough, since that only recognizes the identifier's *shape*, not whether the
+security exists.
+
+An identifier supplied via CLI argument (positional or `--ticker`) is
+validated the same way, but only once: on failure it prints the same message
+and exits nonzero instead of prompting, so scripted/CI usage never blocks on
+input.
+
+```bash
+python3 -m stock_pattern_model analyze NOTAREALTICKER
+# Error: No matching stock was found. Please enter the ticker, company name, or security number again.
+# (exits with a nonzero status)
+```
 
 The packaged CLI defaults to:
 
@@ -467,6 +585,48 @@ Current and historical evidence are separated in the final output:
 - `all_detected_patterns`: the complete detected-label list, including suppressed overlaps and historical labels
 
 Serialized pattern and canonical-event output also exposes invalidation guidance, such as the completed-close level that would invalidate a breakout, breakdown, or reversal setup.
+
+### Final Stock Assessment
+
+Both text and JSON output end with a `final_assessment` that combines the trend, local trend,
+overall bias, rule confidence, and confirmed bullish/bearish pattern evidence already produced by
+the run into one label:
+
+- `recommendation`: `RECOMMEND TO BUY`, `NOT RECOMMENDED`, or `NEUTRAL`
+- `confidence_level`: `LOW`, `MEDIUM`, or `HIGH`
+- `reasoning`: a short explanation of the main factors behind the label
+- `bullish_signals` / `bearish_signals`: the trend and pattern evidence lines that fed the label
+- `disclaimer`: a fixed technical-analysis disclaimer
+
+The recommendation starts from `overall_bias` (Bullish/Bearish maps to
+RECOMMEND TO BUY/NOT RECOMMENDED, Neutral maps to NEUTRAL) and is downgraded to `NEUTRAL` whenever
+bullish and bearish evidence are both currently contributing to the score, or the broad trend
+disagrees with the bias or with the local session trend -- so a single indicator or pattern can
+never drive the label on its own. This is still a rule-based technical read, not a prediction: it
+does not guarantee future performance.
+
+Text output renders this as a fixed block at the very end:
+
+```text
+==================================================
+FINAL STOCK ASSESSMENT
+==================================================
+Recommendation: RECOMMEND TO BUY / NOT RECOMMENDED / NEUTRAL
+
+Reasoning:
+[Brief explanation based on the combined results of the analysis]
+
+Bullish signals:
+- [Relevant bullish signals]
+
+Bearish signals:
+- [Relevant bearish signals]
+
+Confidence level: LOW / MEDIUM / HIGH
+
+Disclaimer: This assessment is based on technical analysis of the available data and is not financial advice.
+==================================================
+```
 
 ## Historical Evaluation
 

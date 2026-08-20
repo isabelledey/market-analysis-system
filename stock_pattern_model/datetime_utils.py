@@ -7,6 +7,21 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+# yfinance-style interval tokens that pandas' Timedelta parser rejects outright
+# (it only understands "W"/"D", not "wk", and has no fixed-duration unit for
+# calendar months at all). 1mo/3mo are approximated as 30/90 days since a
+# Timedelta cannot represent a true calendar month.
+_INTERVAL_TIMEDELTA_ALIASES = {
+    "1wk": "7D",
+    "1mo": "30D",
+    "3mo": "90D",
+}
+
+
+def interval_to_timedelta(interval: str) -> pd.Timedelta:
+    """Convert a yfinance-style interval string into a pandas Timedelta."""
+    return pd.to_timedelta(_INTERVAL_TIMEDELTA_ALIASES.get(interval, interval))
+
 
 def to_zoneinfo(timezone: str | ZoneInfo) -> ZoneInfo:
     """Return a ZoneInfo instance for a timezone name or ZoneInfo object."""

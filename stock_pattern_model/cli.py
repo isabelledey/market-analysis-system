@@ -12,7 +12,11 @@ from typing import Callable
 import pandas as pd
 
 from stock_pattern_model.analysis import analyze_stock
-from stock_pattern_model.config import SUPPORTED_INTERVALS
+from stock_pattern_model.config import (
+    SUPPORTED_INTERVALS,
+    SUPPORTED_TIMEFRAMES,
+    TIMEFRAME_TO_PERIOD_INTERVAL,
+)
 from stock_pattern_model.domain import ResolvedInstrument
 from stock_pattern_model.exceptions import (
     ConfigurationError,
@@ -27,10 +31,23 @@ from stock_pattern_model.exceptions import (
     UnknownSecurityNumberError,
 )
 from stock_pattern_model.formatters import format_analysis_json, format_analysis_text
+from stock_pattern_model.market_data import YFinanceProvider
 from stock_pattern_model.resolver import CsvInstrumentResolver
 from stock_pattern_model.session_utils import SUPPORTED_SESSION_MODES
 
 LOGGER = logging.getLogger(__name__)
+
+DEFAULT_PERIOD = "1mo"
+DEFAULT_INTERVAL = "15m"
+
+NO_MATCHING_STOCK_MESSAGE = (
+    "Error: No matching stock was found. Please enter the ticker, company name, "
+    "or security number again."
+)
+
+# UnknownSecurityNumberError is an InvalidInstrumentError subclass and
+# MarketDataProviderError is a MarketDataError subclass, so this tuple already covers both.
+_INVALID_INSTRUMENT_ERRORS = (InvalidInstrumentError, MarketDataError)
 
 
 class ExitCode(IntEnum):
@@ -63,6 +80,57 @@ def _validate_positive_int(value: int, flag_name: str) -> None:
         raise ConfigurationError(f"{flag_name} must be at least 1.")
 
 
+_TIMEFRAME_MENU: tuple[tuple[str, str, str], ...] = (
+    ("1", "1_DAY", "One day"),
+    ("2", "1_WEEK", "One week"),
+    ("3", "1_MONTH", "One month"),
+    ("4", "3_MONTHS", "Three months"),
+    ("5", "6_MONTHS", "Six months"),
+    ("6", "1_YEAR", "One year"),
+    ("7", "5_YEARS", "Five years"),
+)
+_TIMEFRAME_MENU_BY_NUMBER = {number: (value, label) for number, value, label in _TIMEFRAME_MENU}
+
+
+def _timeframe_menu_text() -> str:
+    lines = ["Choose a timeframe:", ""]
+    lines.extend(f"{number}) {label}" for number, _value, label in _TIMEFRAME_MENU)
+    lines.extend(["", "Enter your choice (1-7): "])
+    return "\n".join(lines)
+
+
+def _prompt_for_timeframe(input_fn: Callable[[str], str]) -> str:
+    menu_text = _timeframe_menu_text()
+    while True:
+        choice = input_fn(menu_text).strip()
+        match = _TIMEFRAME_MENU_BY_NUMBER.get(choice)
+        if match is not None:
+            value, label = match
+            print(f"Selected timeframe: {label} ({value})")
+            return value
+        print(f"Invalid choice: '{choice}'. Please enter a number from 1 to 7.\n")
+
+
+def _resolve_period_and_interval(
+    args: argparse.Namespace,
+    input_fn: Callable[[str], str],
+    interactive: bool,
+) -> tuple[str, str]:
+    if args.timeframe is not None:
+        if args.period is not None or args.interval is not None:
+            raise ConfigurationError(
+                "--timeframe cannot be combined with --period or --interval. "
+                "Choose --timeframe alone, or set --period/--interval manually."
+            )
+        return TIMEFRAME_TO_PERIOD_INTERVAL[args.timeframe]
+    if args.period is not None or args.interval is not None:
+        return args.period or DEFAULT_PERIOD, args.interval or DEFAULT_INTERVAL
+    if interactive:
+        timeframe = _prompt_for_timeframe(input_fn)
+        return TIMEFRAME_TO_PERIOD_INTERVAL[timeframe]
+    return DEFAULT_PERIOD, DEFAULT_INTERVAL
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Create the CLI parser."""
     parser = argparse.ArgumentParser(prog="python -m stock_pattern_model")
@@ -71,8 +139,24 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
     analyze_parser = subparsers.add_parser("analyze", help="Analyze a ticker or security number.")
     analyze_parser.add_argument("identifier", nargs="?", help="Ticker or Israeli security number.")
-    analyze_parser.add_argument("--interval", default="15m", choices=SUPPORTED_INTERVALS)
-    analyze_parser.add_argument("--period", default="1mo")
+    analyze_parser.add_argument(
+        "--ticker",
+        default=None,
+        help="Ticker or Israeli security number (alternative to the positional identifier).",
+    )
+    analyze_parser.add_argument("--interval", default=None, choices=SUPPORTED_INTERVALS)
+    analyze_parser.add_argument("--period", default=None)
+    analyze_parser.add_argument(
+        "--timeframe",
+        choices=SUPPORTED_TIMEFRAMES,
+        default=None,
+        help=(
+            "Preset analysis time range. Automatically selects the matching period "
+            "and interval (1_DAY/1_WEEK -> 15m, 1_MONTH -> 1h, 3_MONTHS/6_MONTHS/1_YEAR "
+            "-> 1d, 5_YEARS -> 1wk). Cannot be combined with --period or --interval. "
+            "Combine with --as-of to look back to a past evening for testing."
+        ),
+    )
     analyze_parser.add_argument("--lookback-bars", type=int, default=12)
     analyze_parser.add_argument("--top", type=int, default=3)
     analyze_parser.add_argument("--all-patterns", action="store_true")
@@ -104,6 +188,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable strict market-data validation (default: enabled).",
     )
     analyze_parser.add_argument("--as-of")
+    analyze_parser.add_argument(
+        "--interactive",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "The timeframe prompt is on by default whenever --timeframe/--period/"
+            "--interval are all omitted. Pass --no-interactive to suppress it and "
+            "keep the 1mo/15m default instead, for scripts and scheduled jobs."
+        ),
+    )
     return parser
 
 
@@ -124,11 +218,60 @@ def _write_output(content: str, output_path: str | None) -> None:
         raise OutputFileError(f"Could not write output file: {output_path}") from error
 
 
-def _prompt_for_identifier(input_fn: Callable[[str], str]) -> str:
-    identifier = input_fn("Enter a ticker or Israeli security number: ")
-    if not identifier.strip():
-        raise InvalidInstrumentError("No instrument identifier was provided.")
-    return identifier
+def _default_instrument_validator(instrument: ResolvedInstrument) -> None:
+    """Confirm a resolved instrument refers to a real security with actual price data.
+
+    Resolver-level resolution is just string/CSV normalization -- it never checks whether the
+    symbol really exists. This performs a small live fetch and lets the provider's own
+    validation (which already rejects an empty result) surface as an error; it does not
+    accept a symbol merely because resolution produced *an* object.
+    """
+    provider = YFinanceProvider()
+    provider.load(
+        symbol=instrument.symbol,
+        interval="1d",
+        period="5d",
+        exchange_timezone=instrument.exchange_timezone,
+    )
+
+
+def _resolve_and_validate_instrument(
+    identifier_arg: str | None,
+    input_fn: Callable[[str], str],
+    resolver: CsvInstrumentResolver,
+    validator: Callable[[ResolvedInstrument], None],
+    mapping_file: str | None,
+) -> tuple[str, ResolvedInstrument]:
+    """Resolve a ticker/company-name/security-number identifier and confirm it refers to a
+    real, existing security with actual price data.
+
+    If ``identifier_arg`` is provided (CLI/non-interactive), one failed attempt raises
+    immediately with a unified error and no retry. If it is None (interactive), the user is
+    re-prompted until a valid, existing security is entered -- this never crashes and never
+    silently proceeds without a genuine match.
+    """
+    if identifier_arg is not None:
+        if not identifier_arg.strip():
+            raise InvalidInstrumentError(NO_MATCHING_STOCK_MESSAGE)
+        try:
+            instrument = resolver.resolve(identifier_arg, mapping_file=mapping_file)
+            validator(instrument)
+        except _INVALID_INSTRUMENT_ERRORS as error:
+            raise InvalidInstrumentError(NO_MATCHING_STOCK_MESSAGE) from error
+        return identifier_arg, instrument
+
+    while True:
+        identifier = input_fn("Enter a ticker or Israeli security number: ")
+        if not identifier.strip():
+            print(NO_MATCHING_STOCK_MESSAGE)
+            continue
+        try:
+            instrument = resolver.resolve(identifier, mapping_file=mapping_file)
+            validator(instrument)
+        except _INVALID_INSTRUMENT_ERRORS:
+            print(NO_MATCHING_STOCK_MESSAGE)
+            continue
+        return identifier, instrument
 
 
 def _run_analyze(
@@ -136,7 +279,15 @@ def _run_analyze(
     input_fn: Callable[[str], str],
     resolver: CsvInstrumentResolver,
     analyzer: Callable[..., dict],
+    interactive: bool,
+    validator: Callable[[ResolvedInstrument], None],
 ) -> str:
+    if args.identifier is not None and args.ticker is not None:
+        raise ConfigurationError(
+            "Provide the ticker either as a positional argument or with --ticker, not both."
+        )
+    if args.identifier is None and args.ticker is not None:
+        args.identifier = args.ticker
     if args.identifier is None and args.data_file:
         identifier = Path(args.data_file).stem
         instrument = ResolvedInstrument(
@@ -148,8 +299,9 @@ def _run_analyze(
             exchange_timezone=args.exchange_timezone,
         )
     else:
-        identifier = args.identifier or _prompt_for_identifier(input_fn)
-        instrument = resolver.resolve(identifier, mapping_file=args.mapping_file)
+        identifier, instrument = _resolve_and_validate_instrument(
+            args.identifier, input_fn, resolver, validator, args.mapping_file
+        )
     _validate_positive_int(args.lookback_bars, "--lookback-bars")
     _validate_positive_int(args.top, "--top")
     if args.history_limit is not None:
@@ -158,12 +310,13 @@ def _run_analyze(
         raise ConfigurationError("--cache-ttl must be >= 0.")
     if args.data_file and args.mapping_file and identifier.isdigit():
         LOGGER.debug("Numeric identifier will be resolved through the mapping file.")
+    period, interval = _resolve_period_and_interval(args, input_fn=input_fn, interactive=interactive)
     as_of = _parse_as_of(args.as_of)
     LOGGER.debug("Resolved instrument: %s", instrument.to_dict())
     result = analyzer(
         instrument.symbol,
-        period=args.period,
-        interval=args.interval,
+        period=period,
+        interval=interval,
         as_of=as_of,
         lookback_bars=args.lookback_bars,
         top_pattern_count=args.top,
@@ -193,6 +346,8 @@ def main(
     input_fn: Callable[[str], str] = input,
     resolver: CsvInstrumentResolver | None = None,
     analyzer: Callable[..., dict] | None = None,
+    interactive: bool | None = None,
+    validator: Callable[[ResolvedInstrument], None] | None = None,
 ) -> int:
     """CLI entry point."""
     parser = build_parser()
@@ -205,9 +360,20 @@ def main(
 
     resolver = resolver or CsvInstrumentResolver()
     analyzer = analyzer or analyze_stock
+    validator = validator or _default_instrument_validator
+    if interactive is None:
+        cli_interactive = getattr(args, "interactive", None)
+        interactive = cli_interactive if cli_interactive is not None else True
 
     try:
-        content = _run_analyze(args, input_fn=input_fn, resolver=resolver, analyzer=analyzer)
+        content = _run_analyze(
+            args,
+            input_fn=input_fn,
+            resolver=resolver,
+            analyzer=analyzer,
+            interactive=interactive,
+            validator=validator,
+        )
         _write_output(content, args.output)
     except UnknownSecurityNumberError as error:
         print(str(error))

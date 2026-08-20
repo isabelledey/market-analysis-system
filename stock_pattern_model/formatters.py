@@ -20,6 +20,22 @@ def _pattern_entry_move_display(pattern_entry_trend: str | None) -> str | None:
     return _PATTERN_ENTRY_MOVE_LABELS.get(pattern_entry_trend, pattern_entry_trend)
 
 
+def _append_pattern_candle_lines(lines: list[str], pattern: dict[str, Any], *, indent: str) -> None:
+    candle = pattern.get("pattern_candle")
+    if not candle:
+        return
+    lines.append(f"{indent}Pattern Candle:")
+    lines.append(f"{indent}  Timestamp: {candle.get('timestamp', 'Unknown')}")
+    lines.append(f"{indent}  Open: {candle.get('open', 'Unknown')}")
+    lines.append(f"{indent}  High: {candle.get('high', 'Unknown')}")
+    lines.append(f"{indent}  Low: {candle.get('low', 'Unknown')}")
+    lines.append(f"{indent}  Close: {candle.get('close', 'Unknown')}")
+    lines.append(f"{indent}  Body Ratio: {candle.get('body_ratio', 'Unknown')}")
+    lines.append(f"{indent}  Upper Wick Ratio: {candle.get('upper_wick_ratio', 'Unknown')}")
+    lines.append(f"{indent}  Lower Wick Ratio: {candle.get('lower_wick_ratio', 'Unknown')}")
+    lines.append(f"{indent}  Close Location: {candle.get('close_location', 'Unknown')}")
+
+
 def _append_transition_lines(lines: list[str], pattern: dict[str, Any], *, indent: str) -> None:
     for label, key in (
         ("State Updated", "state_updated_at_display"),
@@ -90,6 +106,8 @@ def format_analysis_text(
         f"Local Session Trend: {result.get('local_trend', 'Unknown')} "
         f"({result.get('local_trend_score', 'Unknown')}, "
         f"lookback {result.get('local_trend_lookback_bars', 'Unknown')} bars)",
+        f"Latest Candle Direction: {result.get('latest_candle_direction', 'Unknown')} "
+        f"({result.get('latest_candle_direction_score', 'Unknown')})",
         f"Trend Horizon: {result.get('trend_horizon', 'Unknown')}",
         f"Market State: {result.get('market_state', 'Unknown')}",
         f"Overall Bias: {result.get('overall_bias', 'Unknown')}",
@@ -142,6 +160,7 @@ def format_analysis_text(
             lines.append(f"  Bias: {pattern.get('bias', 'Unknown')}")
             lines.append(f"  Geometry: {pattern.get('geometry_label', 'unknown')}")
             lines.append(f"  Context Quality: {pattern.get('context_quality', 'unknown')}")
+            _append_pattern_candle_lines(lines, pattern, indent="  ")
             pre_pattern_move = _pattern_entry_move_display(pattern.get("pattern_entry_trend"))
             if pre_pattern_move:
                 lines.append(f"  Immediate Pre-Pattern Move: {pre_pattern_move}")
@@ -245,6 +264,7 @@ def format_analysis_text(
                 lines.append(f"     Pattern Labels: {', '.join(pattern.get('pattern_labels', []))}")
                 lines.append(f"     Detected at: {pattern.get('detected_at_display', 'Unknown')}")
                 lines.append(f"     State: {pattern.get('state', 'unknown')}")
+                _append_pattern_candle_lines(lines, pattern, indent="     ")
                 _append_transition_lines(lines, pattern, indent="     ")
                 lines.append(
                     f"     Included in Current Score: {'Yes' if pattern.get('included_in_current_score') else 'No'}"
@@ -314,6 +334,7 @@ def format_analysis_text(
                 lines.append(f"  Detected at: {pattern['detected_at_display']}")
                 if pattern.get("confirmation_at_display"):
                     lines.append(f"  Confirmation Time: {pattern['confirmation_at_display']}")
+                _append_pattern_candle_lines(lines, pattern, indent="  ")
                 lines.append(f"  Included in Current Score: {'Yes' if pattern.get('included_in_current_score') else 'No'}")
                 if pattern.get("invalidation_condition"):
                     lines.append(f"  Invalidation Condition: {pattern['invalidation_condition']}")
@@ -393,4 +414,37 @@ def format_analysis_text(
         lines.append("Confidence Breakdown:")
         for key, value in structured["confidence_breakdown"].items():
             lines.append(f"  - {key}: {value}")
+
+    final_assessment = result.get("final_assessment") or {}
+    if final_assessment:
+        separator = "=" * 50
+        lines.append(separator)
+        lines.append("FINAL STOCK ASSESSMENT")
+        lines.append(separator)
+        lines.append(f"Recommendation: {final_assessment.get('recommendation', 'Unknown')}")
+        lines.append("")
+        lines.append("Reasoning:")
+        lines.append(final_assessment.get("reasoning", ""))
+        lines.append("")
+        lines.append("Bullish signals:")
+        bullish_signals = final_assessment.get("bullish_signals") or []
+        if bullish_signals:
+            for signal in bullish_signals:
+                lines.append(f"- {signal}")
+        else:
+            lines.append("- None")
+        lines.append("")
+        lines.append("Bearish signals:")
+        bearish_signals = final_assessment.get("bearish_signals") or []
+        if bearish_signals:
+            for signal in bearish_signals:
+                lines.append(f"- {signal}")
+        else:
+            lines.append("- None")
+        lines.append("")
+        lines.append(f"Confidence level: {final_assessment.get('confidence_level', 'Unknown')}")
+        lines.append("")
+        lines.append(f"Disclaimer: {final_assessment.get('disclaimer', '')}")
+        lines.append(separator)
+
     return "\n".join(lines)

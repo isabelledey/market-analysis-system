@@ -7,8 +7,10 @@ from dataclasses import dataclass
 from statistics import mean
 from typing import Any
 
+import pandas as pd
+
 from stock_pattern_model.config import ScoringConfig
-from stock_pattern_model.datetime_utils import format_compact_display_datetime
+from stock_pattern_model.datetime_utils import format_compact_display_datetime, interval_to_timedelta
 from stock_pattern_model.domain import DataQualityReport, PatternScoreEligibility
 from stock_pattern_model.session_utils import session_date_for_timestamp
 
@@ -241,6 +243,7 @@ def _anchor_timestamp(pattern: dict[str, Any], anchor_type: str) -> Any:
 def evaluate_pattern_eligibility(
     pattern: dict[str, Any],
     config: ScoringConfig,
+    interval: str,
 ) -> PatternScoreEligibility:
     anchor_type, anchor_index = _eligibility_anchor(pattern)
     detection_age = int(pattern.get("candles_ago", 0))
@@ -261,16 +264,24 @@ def evaluate_pattern_eligibility(
     # last few bars of a prior session can look just as "recent" as one from a few bars
     # into the current session. Require same trading-session date on top of the bar-age
     # cutoff so yesterday's late-session patterns can't leak into today's score.
-    anchor_at = _anchor_timestamp(pattern, anchor_type)
-    last_completed_at = pattern.get("last_completed_candle_at")
-    if anchor_at is not None and last_completed_at is not None:
-        exchange_timezone = getattr(pattern.get("event"), "exchange_timezone", None)
-        if session_date_for_timestamp(anchor_at, exchange_timezone) != session_date_for_timestamp(
-            last_completed_at, exchange_timezone
-        ):
-            return PatternScoreEligibility(
-                False, "outside current trading session", anchor_type, anchor_index, age_bars, max_age_bars
-            )
+    #
+    # This only makes sense for intraday intervals, where a session spans many bars: for
+    # daily/weekly intervals each bar *is* its own calendar-day "session", so this check
+    # would disqualify every pattern except one from the single latest bar, regardless of
+    # max_age_bars -- the bar-index age check below already correctly captures "how many
+    # trading days/weeks ago" for those intervals, without needing a same-day gate on top.
+    is_intraday = interval_to_timedelta(interval) < pd.Timedelta(days=1)
+    if is_intraday:
+        anchor_at = _anchor_timestamp(pattern, anchor_type)
+        last_completed_at = pattern.get("last_completed_candle_at")
+        if anchor_at is not None and last_completed_at is not None:
+            exchange_timezone = getattr(pattern.get("event"), "exchange_timezone", None)
+            if session_date_for_timestamp(anchor_at, exchange_timezone) != session_date_for_timestamp(
+                last_completed_at, exchange_timezone
+            ):
+                return PatternScoreEligibility(
+                    False, "outside current trading session", anchor_type, anchor_index, age_bars, max_age_bars
+                )
 
     if pattern.get("dependency_suppressed"):
         return PatternScoreEligibility(False, "linked confirmation duplicate", anchor_type, anchor_index, age_bars, max_age_bars)
@@ -483,7 +494,7 @@ class ScoringService:
         interval: str,
         latest_volume_baseline_source: str,
     ) -> dict[str, Any]:
-        enriched_patterns = self._enrich_patterns(patterns)
+        enriched_patterns = self._enrich_patterns(patterns, interval)
         score_patterns = [pattern for pattern in enriched_patterns if pattern["score_eligible"]]
         score_groups = self._group_primary_patterns(score_patterns)
         primary_patterns = list(score_groups["primary_patterns"])
@@ -556,7 +567,7 @@ class ScoringService:
             "explanation": explanation,
         }
 
-    def _enrich_patterns(self, patterns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _enrich_patterns(self, patterns: list[dict[str, Any]], interval: str) -> list[dict[str, Any]]:
         enriched = [dict(pattern) for pattern in patterns]
         for pattern in enriched:
             event = pattern["event"]
@@ -565,7 +576,7 @@ class ScoringService:
             pattern["evidence_group"] = pattern.get("evidence_group") or build_evidence_group(pattern)
             pattern["event_state"] = pattern.get("event_state") or self._base_event_state(pattern)
             pattern.update(_confirmation_fields(pattern))
-            decision = evaluate_pattern_eligibility(pattern, self.config)
+            decision = evaluate_pattern_eligibility(pattern, self.config, interval)
             pattern["score_eligibility"] = decision.to_dict()
             pattern["score_anchor_type"] = decision.anchor_type
             pattern["score_anchor_index"] = decision.anchor_index

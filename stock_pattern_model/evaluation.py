@@ -12,6 +12,7 @@ import pandas as pd
 from stock_pattern_model.analysis import analyze_dataframe
 from stock_pattern_model.config import HistoricalEvaluationConfig, MarketDataConfig
 from stock_pattern_model.context import build_analysis_context
+from stock_pattern_model.datetime_utils import interval_to_timedelta
 from stock_pattern_model.domain import (
     DataQualityReport,
     HistoricalEvaluationResult,
@@ -39,7 +40,7 @@ from stock_pattern_model.session_utils import (
 
 
 def _get_bar_timedelta(interval: str) -> pd.Timedelta:
-    return pd.to_timedelta(interval)
+    return interval_to_timedelta(interval)
 
 
 def _get_bar_end(timestamp: pd.Timestamp, interval: str) -> pd.Timestamp:

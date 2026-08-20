@@ -101,7 +101,7 @@ def test_shooting_star_directionally_confirmed_by_close_below_its_low() -> None:
 
     feature_df = add_features(df_probe)
     feature_df = classify_intraday_trend(feature_df, lookback_bars=12, pivot_left_bars=2, pivot_right_bars=2, breakout_lookback=20)
-    feature_df = classify_local_session_trend(feature_df, lookback_bars=20)
+    feature_df = classify_local_session_trend(feature_df, interval="15m", lookback_bars=20)
     rejection_event = ShootingStarDetector().detect(feature_df, PatternConfig(), "15m")[-1]
     low = rejection_event.relevant_prices["low"]
 
@@ -135,7 +135,7 @@ def test_shooting_star_invalidated_by_close_above_its_high() -> None:
 
     feature_df = add_features(df_probe)
     feature_df = classify_intraday_trend(feature_df, lookback_bars=12, pivot_left_bars=2, pivot_right_bars=2, breakout_lookback=20)
-    feature_df = classify_local_session_trend(feature_df, lookback_bars=20)
+    feature_df = classify_local_session_trend(feature_df, interval="15m", lookback_bars=20)
     rejection_event = ShootingStarDetector().detect(feature_df, PatternConfig(), "15m")[-1]
     high = rejection_event.relevant_prices["high"]
 

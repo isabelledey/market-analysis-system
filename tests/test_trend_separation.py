@@ -113,8 +113,8 @@ def test_local_trend_lookback_is_configurable_and_session_capped() -> None:
     df = make_broad_uptrend_local_decline_df()
     feature_df = add_features(df)
 
-    wide = classify_local_session_trend(feature_df, lookback_bars=20)
-    narrow = classify_local_session_trend(feature_df, lookback_bars=3)
+    wide = classify_local_session_trend(feature_df, interval="15m", lookback_bars=20)
+    narrow = classify_local_session_trend(feature_df, interval="15m", lookback_bars=3)
 
     # The final session only has 4 bars, so even the "wide" lookback is capped to
     # the number of bars available in the current session (never looks past it).
@@ -131,11 +131,116 @@ def test_local_trend_is_never_computed_from_broad_horizon_alone() -> None:
     # must be Neutral even while sitting inside a long, strongly bullish broad trend.
     df = make_broad_uptrend_local_decline_df()
     feature_df = add_features(df)
-    local = classify_local_session_trend(feature_df, lookback_bars=20)
+    local = classify_local_session_trend(feature_df, interval="15m", lookback_bars=20)
 
     first_bar_of_final_session_index = 288
     assert local.iloc[first_bar_of_final_session_index]["Local_Trend_Lookback_Bars"] == 1
     assert local.iloc[first_bar_of_final_session_index]["Local_Trend"] == "Neutral"
+
+
+def make_daily_uptrend_df(length: int = 40, *, breakout_last_bar: bool = False) -> pd.DataFrame:
+    """Daily-interval OHLCV: every bar is its own calendar day, so Session_Date is unique per
+    row -- exactly the case that used to collapse Local_Trend to a single bar."""
+    timestamps = pd.date_range(start="2026-05-01", periods=length, freq="1D", tz=EXCHANGE_TZ)
+    rows = []
+    price = 50.0
+    for index, timestamp in enumerate(timestamps):
+        step = price + index * 0.5
+        rows.append(_bar(timestamp, step, step + 0.3, step - 0.3, step + 0.1, 5_000_000 + index * 1000))
+    if breakout_last_bar:
+        last_close = rows[-1]["Close"]
+        rows[-1] = _bar(
+            timestamps[-1],
+            last_close,
+            last_close + 3.0,
+            last_close - 0.1,
+            last_close + 2.8,
+            40_000_000,
+        )
+    return _build_df(rows)
+
+
+def make_weekly_uptrend_df(length: int = 30, *, breakout_last_bar: bool = False) -> pd.DataFrame:
+    """Weekly-interval OHLCV: same degenerate-session case as daily, one calendar day per bar."""
+    timestamps = pd.date_range(start="2026-01-05", periods=length, freq="7D", tz=EXCHANGE_TZ)
+    rows = []
+    price = 50.0
+    for index, timestamp in enumerate(timestamps):
+        step = price + index * 0.8
+        rows.append(_bar(timestamp, step, step + 0.5, step - 0.5, step + 0.2, 5_000_000 + index * 1000))
+    if breakout_last_bar:
+        last_close = rows[-1]["Close"]
+        rows[-1] = _bar(
+            timestamps[-1],
+            last_close,
+            last_close + 5.0,
+            last_close - 0.2,
+            last_close + 4.6,
+            40_000_000,
+        )
+    return _build_df(rows)
+
+
+def test_daily_interval_local_trend_uses_rolling_multi_candle_window() -> None:
+    df = make_daily_uptrend_df(length=40)
+    feature_df = add_features(df)
+
+    local = classify_local_session_trend(feature_df, interval="1d", lookback_bars=20)
+
+    # Every daily bar is its own Session_Date, so the old session-anchored window would be
+    # stuck at 1 forever. The rolling window must instead grow up to the configured lookback.
+    assert int(local.iloc[-1]["Local_Trend_Lookback_Bars"]) == 20
+    assert int(local.iloc[19]["Local_Trend_Lookback_Bars"]) == 20
+    assert int(local.iloc[5]["Local_Trend_Lookback_Bars"]) == 6
+
+
+def test_weekly_interval_local_trend_uses_rolling_multi_candle_window() -> None:
+    df = make_weekly_uptrend_df(length=30)
+    feature_df = add_features(df)
+
+    local = classify_local_session_trend(feature_df, interval="1wk", lookback_bars=20)
+
+    assert int(local.iloc[-1]["Local_Trend_Lookback_Bars"]) == 20
+
+
+def test_daily_interval_local_trend_reaches_structural_evaluation() -> None:
+    # With >=8 bars in the rolling window, the structural snapshot (slope/MA/persistence/
+    # swing) must actually be evaluated instead of being silently zeroed out.
+    df = make_daily_uptrend_df(length=40)
+    feature_df = add_features(df)
+
+    local = classify_local_session_trend(feature_df, interval="1d", lookback_bars=20)
+
+    assert local.iloc[-1]["Local_Trend"] == "Uptrend"
+    assert local.iloc[-1]["Local_Trend_Score"] >= 18.0
+
+
+def test_strong_daily_breakout_is_not_reported_as_neutral_local_trend() -> None:
+    df = make_daily_uptrend_df(length=40, breakout_last_bar=True)
+
+    result = analyze_dataframe(
+        df=df,
+        symbol="DAILYBREAK",
+        interval="1d",
+        as_of=pd.Timestamp(df.iloc[-1]["Datetime"]) + pd.Timedelta(days=1),
+    )
+
+    assert result["local_trend"] != "Neutral"
+    assert result["local_trend"] == "Uptrend"
+    assert result["local_trend_lookback_bars"] > 1
+    assert result["broad_trend"] == "Uptrend"
+
+
+def test_intraday_local_trend_still_uses_session_anchored_window() -> None:
+    # Regression guard: the daily/weekly rolling-window fix must not change intraday behavior
+    # at all. Reruns the existing session-capped assertions directly against the fixed function.
+    df = make_broad_uptrend_local_decline_df()
+    feature_df = add_features(df)
+
+    local = classify_local_session_trend(feature_df, interval="15m", lookback_bars=20)
+
+    assert int(local.iloc[-1]["Local_Trend_Lookback_Bars"]) == 4
+    assert local.iloc[-1]["Local_Trend"] == "Downtrend"
 
 
 def make_bearish_broad_trend_with_confirmed_bullish_pin_bar() -> pd.DataFrame:

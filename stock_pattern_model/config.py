@@ -31,6 +31,30 @@ SUPPORTED_INTERVALS = (
     "3mo",
 )
 
+SUPPORTED_TIMEFRAMES = (
+    "1_DAY",
+    "1_WEEK",
+    "1_MONTH",
+    "3_MONTHS",
+    "6_MONTHS",
+    "1_YEAR",
+    "5_YEARS",
+)
+
+# Each timeframe preset maps to a fixed (period, interval) pair for yfinance.
+# 1_WEEK uses period="5d" rather than "1wk"/"7d" because yfinance only accepts
+# 1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, 10y, ytd, max as period values; "5d" is the
+# closest valid approximation of a one-week span (five trading days).
+TIMEFRAME_TO_PERIOD_INTERVAL: dict[str, tuple[str, str]] = {
+    "1_DAY": ("1d", "15m"),
+    "1_WEEK": ("5d", "15m"),
+    "1_MONTH": ("1mo", "1h"),
+    "3_MONTHS": ("3mo", "1d"),
+    "6_MONTHS": ("6mo", "1d"),
+    "1_YEAR": ("1y", "1d"),
+    "5_YEARS": ("5y", "1wk"),
+}
+
 
 @dataclass(frozen=True)
 class PatternConfig:
