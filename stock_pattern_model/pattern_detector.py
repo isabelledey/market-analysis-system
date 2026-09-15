@@ -324,12 +324,30 @@ def _is_strong_break_event(
     )
 
 
-def _same_pattern_session(data: pd.DataFrame, *indices: int) -> bool:
-    if "Pattern_Session_Key" in data.columns:
-        keys = {str(data.iloc[index]["Pattern_Session_Key"]) for index in indices}
-        return len(keys) == 1
-    fallback_keys = pattern_session_key_series(data.iloc[list(indices)]["Datetime"])
-    return fallback_keys.nunique() == 1
+def _is_intraday_interval(interval: str) -> bool:
+    return _get_bar_timedelta(interval) < pd.Timedelta(days=1)
+
+
+def _same_pattern_session(data: pd.DataFrame, *indices: int, interval: str) -> bool:
+    if _is_intraday_interval(interval):
+        if "Pattern_Session_Key" in data.columns:
+            keys = {str(data.iloc[index]["Pattern_Session_Key"]) for index in indices}
+            return len(keys) == 1
+        fallback_keys = pattern_session_key_series(data.iloc[list(indices)]["Datetime"])
+        return fallback_keys.nunique() == 1
+    # A daily-or-larger bar already represents a full trading session on its
+    # own, so multi-bar patterns are expected to span multiple calendar days
+    # (that is the whole point of a pattern like Morning Star). Only reject
+    # the sequence when consecutive bars are separated by an abnormally large
+    # gap (e.g. an extended trading halt), where treating them as one
+    # continuous setup would be misleading.
+    sorted_indices = sorted(indices)
+    max_allowed_gap = _get_bar_timedelta(interval) * 10
+    for earlier, later in zip(sorted_indices, sorted_indices[1:]):
+        gap = pd.Timestamp(data.iloc[later]["Datetime"]) - pd.Timestamp(data.iloc[earlier]["Datetime"])
+        if gap > max_allowed_gap:
+            return False
+    return True
 
 
 class PatternDetector(Protocol):
@@ -472,7 +490,7 @@ class BullishEngulfingDetector(BasePatternDetector):
         for index in range(1, len(data)):
             previous_row = data.iloc[index - 1]
             row = data.iloc[index]
-            if not _same_pattern_session(data, index - 1, index):
+            if not _same_pattern_session(data, index - 1, index, interval=interval):
                 continue
             if not (
                 bool(previous_row["Is_Bearish"])
@@ -522,7 +540,7 @@ class BearishEngulfingDetector(BasePatternDetector):
         for index in range(1, len(data)):
             previous_row = data.iloc[index - 1]
             row = data.iloc[index]
-            if not _same_pattern_session(data, index - 1, index):
+            if not _same_pattern_session(data, index - 1, index, interval=interval):
                 continue
             if not (
                 bool(previous_row["Is_Bullish"])
@@ -878,7 +896,7 @@ class InsideBarDetector(BasePatternDetector):
         for index in range(1, len(data)):
             previous_row = data.iloc[index - 1]
             row = data.iloc[index]
-            if not _same_pattern_session(data, index - 1, index):
+            if not _same_pattern_session(data, index - 1, index, interval=interval):
                 continue
             if not (
                 row["High"] < previous_row["High"]
@@ -924,7 +942,7 @@ class InsideBarFailureDetector(BasePatternDetector):
     def detect(self, data: pd.DataFrame, config: PatternConfig, interval: str) -> list[PatternEvent]:
         events: list[PatternEvent] = []
         for index in range(2, len(data)):
-            if not _same_pattern_session(data, index - 2, index - 1, index):
+            if not _same_pattern_session(data, index - 2, index - 1, index, interval=interval):
                 continue
             mother_bar = data.iloc[index - 2]
             inside_bar = data.iloc[index - 1]
@@ -1015,7 +1033,7 @@ class BreakoutDetector(BasePatternDetector):
             previous_reference = previous_reference_high.iloc[index]
             if pd.isna(current_reference) or pd.isna(previous_reference):
                 continue
-            if not _same_pattern_session(data, index - 1, index):
+            if not _same_pattern_session(data, index - 1, index, interval=interval):
                 active_reference = None
                 active_tolerance = None
                 continue
@@ -1107,7 +1125,7 @@ class BreakdownDetector(BasePatternDetector):
             previous_reference = previous_reference_low.iloc[index]
             if pd.isna(current_reference) or pd.isna(previous_reference):
                 continue
-            if not _same_pattern_session(data, index - 1, index):
+            if not _same_pattern_session(data, index - 1, index, interval=interval):
                 active_reference = None
                 active_tolerance = None
                 continue
@@ -1228,7 +1246,7 @@ class MorningStarDetector(BasePatternDetector):
     def detect(self, data: pd.DataFrame, config: PatternConfig, interval: str) -> list[PatternEvent]:
         events: list[PatternEvent] = []
         for index in range(2, len(data)):
-            if not _same_pattern_session(data, index - 2, index - 1, index):
+            if not _same_pattern_session(data, index - 2, index - 1, index, interval=interval):
                 continue
             first = data.iloc[index - 2]
             second = data.iloc[index - 1]
@@ -1292,7 +1310,7 @@ class EveningStarDetector(BasePatternDetector):
     def detect(self, data: pd.DataFrame, config: PatternConfig, interval: str) -> list[PatternEvent]:
         events: list[PatternEvent] = []
         for index in range(2, len(data)):
-            if not _same_pattern_session(data, index - 2, index - 1, index):
+            if not _same_pattern_session(data, index - 2, index - 1, index, interval=interval):
                 continue
             first = data.iloc[index - 2]
             second = data.iloc[index - 1]

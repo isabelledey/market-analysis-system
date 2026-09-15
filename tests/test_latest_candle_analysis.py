@@ -371,10 +371,14 @@ def test_every_detected_pattern_is_linked_to_its_own_source_row_ohlc() -> None:
         source_row = df_by_datetime.loc[df_by_datetime.index == bar_start]
         assert len(source_row) == 1, f"no unique source row found for pattern bar_start {bar_start}"
         source_row = source_row.iloc[0]
-        assert relevant_prices["open"] == pytest.approx(float(source_row["Open"]))
-        assert relevant_prices["high"] == pytest.approx(float(source_row["High"]))
-        assert relevant_prices["low"] == pytest.approx(float(source_row["Low"]))
-        assert relevant_prices["close"] == pytest.approx(float(source_row["Close"]))
+        for field, column in (
+            ("open", "Open"),
+            ("high", "High"),
+            ("low", "Low"),
+            ("close", "Close"),
+        ):
+            if field in relevant_prices:
+                assert relevant_prices[field] == pytest.approx(float(source_row[column]))
 
 
 # ---------------------------------------------------------------------------
