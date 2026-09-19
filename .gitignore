@@ -10,3 +10,4 @@ build/
 outputs/
 .coverage
 htmlcov/
+.idea/

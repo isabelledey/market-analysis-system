@@ -104,7 +104,7 @@ python3 main.py AAPL
 named flags:
 
 ```bash
-python3 main.py --ticker AAPL --timeframe 3_MONTHS
+python3 main.py --ticker AAPL --timeframe 1_DAY
 ```
 
 Providing both the positional identifier and `--ticker` at the same time is a
@@ -185,27 +185,27 @@ python3 -m stock_pattern_model analyze AAPL --as-of 2026-07-10T16:46:00-04:00
 Choose a preset analysis timeframe instead of manual `--period`/`--interval`:
 
 ```bash
-python3 -m stock_pattern_model analyze AAPL --timeframe 3_MONTHS
+python3 -m stock_pattern_model analyze AAPL --timeframe 1_DAY
 ```
 
-`--timeframe` automatically selects a matching period and interval:
+`--timeframe` selects the candle size and a lookback long enough to contain many candles of
+that size (it is not the span of time analyzed):
 
 | Timeframe   | Period | Interval |
 |-------------|--------|----------|
-| `1_DAY`     | `1d`   | `15m`    |
-| `1_WEEK`    | `5d`   | `15m`    |
-| `1_MONTH`   | `1mo`  | `1h`     |
-| `3_MONTHS`  | `3mo`  | `1d`     |
-| `6_MONTHS`  | `6mo`  | `1d`     |
-| `1_YEAR`    | `1y`   | `1d`     |
-| `5_YEARS`   | `5y`   | `1wk`    |
+| `1_DAY`     | `6mo`  | `1d`     |
+| `1_WEEK`    | `5y`   | `1wk`    |
+| `1_MONTH`   | `10y`  | `1mo`    |
+
+For intraday candles (for example 15-minute bars), pass `--period` and `--interval` manually, such as
+`--period 1mo --interval 15m`.
 
 `--timeframe` cannot be combined with `--period` or `--interval`; doing so raises a
 configuration error. Combine `--timeframe` with `--as-of` to look back to a past
 point in time (for example, running analysis every evening for testing).
 
 If `--timeframe`, `--period`, and `--interval` are all omitted, the CLI prompts
-you to choose one of the seven timeframe presets by number instead of silently
+you to choose one of the three timeframe presets by number instead of silently
 defaulting to `1mo`/`15m`:
 
 ```text
@@ -215,20 +215,16 @@ Choose a timeframe:
 1) One day
 2) One week
 3) One month
-4) Three months
-5) Six months
-6) One year
-7) Five years
 
-Enter your choice (1-7):
+Enter your choice (1-3):
 ```
 
-Entering a number outside 1-7, non-numeric text, or an empty value prints an
+Entering a number outside 1-3, non-numeric text, or an empty value prints an
 error and re-shows the menu; it never crashes or exits the program. A valid
 selection echoes both the readable label and the internal value it maps to,
-for example `Selected timeframe: Three months (3_MONTHS)`. This numbered menu
+for example `Selected timeframe: One day (1_DAY)`. This numbered menu
 is interactive-only and has no effect on `--timeframe`, which still takes the
-internal value directly (`--timeframe 3_MONTHS`) for scripted/CLI usage.
+internal value directly (`--timeframe 1_DAY`) for scripted/CLI usage.
 
 This means plain, no-flag invocations always prompt for both the instrument and
 the timeframe:
@@ -249,11 +245,11 @@ ticker, or supply `--timeframe`/`--period`/`--interval` directly:
 
 ```bash
 python3 -m stock_pattern_model analyze AAPL --no-interactive
-python3 -m stock_pattern_model analyze AAPL --timeframe 3_MONTHS
+python3 -m stock_pattern_model analyze AAPL --timeframe 1_DAY
 ```
 
 ```bash
-python3 -m stock_pattern_model analyze AAPL --timeframe 6_MONTHS --as-of 2026-08-14T23:59:00+03:00
+python3 -m stock_pattern_model analyze AAPL --timeframe 1_DAY --as-of 2026-08-14T23:59:00+03:00
 ```
 
 ### Ticker Validation

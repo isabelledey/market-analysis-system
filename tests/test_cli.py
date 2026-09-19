@@ -328,10 +328,10 @@ def test_interactive_never_reaches_timeframe_menu_on_invalid_ticker(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     # Requirement: do not continue to the timeframe menu until the security is valid. Only
-    # one timeframe-menu response ("4") is supplied; if the invalid identifier attempt
+    # one timeframe-menu response ("1") is supplied; if the invalid identifier attempt
     # incorrectly fell through to the timeframe menu, that response would be consumed at the
     # wrong point and this would fail with a StopIteration or a mismatched period/interval.
-    responses = iter(["BADCOMPANY", "AAPL", "4"])
+    responses = iter(["BADCOMPANY", "AAPL", "1"])
 
     def fake_input(prompt: str) -> str:
         return next(responses)
@@ -357,8 +357,8 @@ def test_interactive_never_reaches_timeframe_menu_on_invalid_ticker(
 
     assert exit_code == ExitCode.SUCCESS
     assert captured.out.count(NO_MATCHING_STOCK_MESSAGE) == 1
-    assert captured.out.count("Selected timeframe: Three months (3_MONTHS)") == 1
-    assert (captured_kwargs["period"], captured_kwargs["interval"]) == ("3mo", "1d")
+    assert captured.out.count("Selected timeframe: One day (1_DAY)") == 1
+    assert (captured_kwargs["period"], captured_kwargs["interval"]) == ("6mo", "1d")
 
 
 def test_interactive_israeli_security_number_still_resolves(tmp_path: Path) -> None:
@@ -587,7 +587,7 @@ def test_timeframe_combines_with_as_of_for_look_back_testing() -> None:
             "analyze",
             "AAPL",
             "--timeframe",
-            "6_MONTHS",
+            "1_DAY",
             "--as-of",
             "2026-07-10T16:46:00-04:00",
             "--format",
@@ -627,14 +627,14 @@ def test_ticker_flag_is_equivalent_to_positional_identifier() -> None:
         return {"symbol": symbol}
 
     exit_code = main(
-        ["analyze", "--ticker", "PYPL", "--timeframe", "3_MONTHS", "--format", "json"],
+        ["analyze", "--ticker", "PYPL", "--timeframe", "1_DAY", "--format", "json"],
         analyzer=capturing_analyzer,
         interactive=False,
     )
 
     assert exit_code == ExitCode.SUCCESS
     assert captured_kwargs.get("instrument") is not None
-    assert (captured_kwargs["period"], captured_kwargs["interval"]) == ("3mo", "1d")
+    assert (captured_kwargs["period"], captured_kwargs["interval"]) == ("6mo", "1d")
 
 
 def test_ticker_flag_and_positional_identifier_together_raises_configuration_error(
@@ -658,7 +658,7 @@ def test_interactive_run_prompts_for_timeframe_when_omitted(
 
     def fake_input(prompt: str) -> str:
         prompts.append(prompt)
-        return "4"
+        return "1"
 
     def capturing_analyzer(symbol: str, **kwargs) -> dict:
         captured_kwargs.update(kwargs)
@@ -674,14 +674,14 @@ def test_interactive_run_prompts_for_timeframe_when_omitted(
 
     assert exit_code == ExitCode.SUCCESS
     assert prompts == [_timeframe_menu_text()]
-    assert (captured_kwargs["period"], captured_kwargs["interval"]) == ("3mo", "1d")
-    assert "Selected timeframe: Three months (3_MONTHS)" in captured.out
+    assert (captured_kwargs["period"], captured_kwargs["interval"]) == ("6mo", "1d")
+    assert "Selected timeframe: One day (1_DAY)" in captured.out
 
 
 def test_interactive_run_retries_on_invalid_timeframe_choice_until_valid(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    responses = iter(["next_tuesday", "", "0", "8", "6"])
+    responses = iter(["next_tuesday", "", "0", "4", "3"])
 
     def fake_input(prompt: str) -> str:
         return next(responses)
@@ -701,18 +701,18 @@ def test_interactive_run_retries_on_invalid_timeframe_choice_until_valid(
     captured = capsys.readouterr()
 
     assert exit_code == ExitCode.SUCCESS
-    assert (captured_kwargs["period"], captured_kwargs["interval"]) == ("1y", "1d")
-    assert "Invalid choice: 'next_tuesday'. Please enter a number from 1 to 7." in captured.out
-    assert "Invalid choice: ''. Please enter a number from 1 to 7." in captured.out
-    assert "Invalid choice: '0'. Please enter a number from 1 to 7." in captured.out
-    assert "Invalid choice: '8'. Please enter a number from 1 to 7." in captured.out
-    assert "Selected timeframe: One year (1_YEAR)" in captured.out
+    assert (captured_kwargs["period"], captured_kwargs["interval"]) == ("10y", "1mo")
+    assert "Invalid choice: 'next_tuesday'. Please enter a number from 1 to 3." in captured.out
+    assert "Invalid choice: ''. Please enter a number from 1 to 3." in captured.out
+    assert "Invalid choice: '0'. Please enter a number from 1 to 3." in captured.out
+    assert "Invalid choice: '4'. Please enter a number from 1 to 3." in captured.out
+    assert "Selected timeframe: One month (1_MONTH)" in captured.out
 
 
 def test_interactive_run_never_raises_on_invalid_timeframe_input() -> None:
     # Requirement: invalid input must never crash or terminate the program -- it must keep
-    # re-prompting until a valid 1-7 selection is made.
-    responses = iter(["not-a-number", "5"])
+    # re-prompting until a valid 1-3 selection is made.
+    responses = iter(["not-a-number", "2"])
 
     def fake_input(prompt: str) -> str:
         return next(responses)
@@ -741,14 +741,14 @@ def test_interactive_run_does_not_prompt_when_timeframe_flag_given() -> None:
         raise AssertionError(f"input_fn should not be called, got prompt: {prompt!r}")
 
     exit_code = main(
-        ["analyze", "AAPL", "--timeframe", "1_YEAR", "--format", "json"],
+        ["analyze", "AAPL", "--timeframe", "1_WEEK", "--format", "json"],
         input_fn=unexpected_input,
         analyzer=capturing_analyzer,
         interactive=True,
     )
 
     assert exit_code == ExitCode.SUCCESS
-    assert (captured_kwargs["period"], captured_kwargs["interval"]) == ("1y", "1d")
+    assert (captured_kwargs["period"], captured_kwargs["interval"]) == ("5y", "1wk")
 
 
 def test_interactive_run_does_not_prompt_when_period_given_manually() -> None:
@@ -810,7 +810,7 @@ def test_cli_interactive_flag_forces_prompt_even_when_stdin_is_not_a_tty() -> No
 
     assert exit_code == ExitCode.SUCCESS
     assert prompts == [_timeframe_menu_text()]
-    assert (captured_kwargs["period"], captured_kwargs["interval"]) == ("5d", "15m")
+    assert (captured_kwargs["period"], captured_kwargs["interval"]) == ("5y", "1wk")
 
 
 def test_cli_no_interactive_flag_skips_prompt() -> None:

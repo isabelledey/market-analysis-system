@@ -84,10 +84,6 @@ _TIMEFRAME_MENU: tuple[tuple[str, str, str], ...] = (
     ("1", "1_DAY", "One day"),
     ("2", "1_WEEK", "One week"),
     ("3", "1_MONTH", "One month"),
-    ("4", "3_MONTHS", "Three months"),
-    ("5", "6_MONTHS", "Six months"),
-    ("6", "1_YEAR", "One year"),
-    ("7", "5_YEARS", "Five years"),
 )
 _TIMEFRAME_MENU_BY_NUMBER = {number: (value, label) for number, value, label in _TIMEFRAME_MENU}
 
@@ -95,7 +91,7 @@ _TIMEFRAME_MENU_BY_NUMBER = {number: (value, label) for number, value, label in 
 def _timeframe_menu_text() -> str:
     lines = ["Choose a timeframe:", ""]
     lines.extend(f"{number}) {label}" for number, _value, label in _TIMEFRAME_MENU)
-    lines.extend(["", "Enter your choice (1-7): "])
+    lines.extend(["", "Enter your choice (1-3): "])
     return "\n".join(lines)
 
 
@@ -108,7 +104,7 @@ def _prompt_for_timeframe(input_fn: Callable[[str], str]) -> str:
             value, label = match
             print(f"Selected timeframe: {label} ({value})")
             return value
-        print(f"Invalid choice: '{choice}'. Please enter a number from 1 to 7.\n")
+        print(f"Invalid choice: '{choice}'. Please enter a number from 1 to 3.\n")
 
 
 def _resolve_period_and_interval(
@@ -151,10 +147,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=SUPPORTED_TIMEFRAMES,
         default=None,
         help=(
-            "Preset analysis time range. Automatically selects the matching period "
-            "and interval (1_DAY/1_WEEK -> 15m, 1_MONTH -> 1h, 3_MONTHS/6_MONTHS/1_YEAR "
-            "-> 1d, 5_YEARS -> 1wk). Cannot be combined with --period or --interval. "
-            "Combine with --as-of to look back to a past evening for testing."
+            "Preset candle size. Selects the candle/bar interval (1_DAY -> 1d, 1_WEEK -> 1wk, "
+            "1_MONTH -> 1mo) plus an independently-sized "
+            "historical lookback long enough to contain many candles of that size, not just one. "
+            "Cannot be combined with --period or --interval. Combine with --as-of to look back to "
+            "a past evening for testing."
         ),
     )
     analyze_parser.add_argument("--lookback-bars", type=int, default=12)

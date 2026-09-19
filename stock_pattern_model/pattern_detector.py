@@ -1245,53 +1245,113 @@ class MorningStarDetector(BasePatternDetector):
 
     def detect(self, data: pd.DataFrame, config: PatternConfig, interval: str) -> list[PatternEvent]:
         events: list[PatternEvent] = []
-        for index in range(2, len(data)):
-            if not _same_pattern_session(data, index - 2, index - 1, index, interval=interval):
+        last_index = len(data) - 1
+        for index in range(1, len(data)):
+            first_index = index - 1
+            if not _same_pattern_session(data, first_index, index, interval=interval):
                 continue
-            first = data.iloc[index - 2]
-            second = data.iloc[index - 1]
-            third = data.iloc[index]
+            first = data.iloc[first_index]
+            second = data.iloc[index]
+            second_high_body = max(float(second["Open"]), float(second["Close"]))
+            second_low_body = min(float(second["Open"]), float(second["Close"]))
+            setup_tolerance = _gap_tolerance(
+                float(first["Candle_Range"]),
+                float(second["Candle_Range"]),
+                ratio=config.gap_tolerance_ratio,
+            )
+            setup_matches = (
+                bool(first["Is_Bearish"])
+                and float(first["Body_Ratio"]) >= 0.45
+                and float(second["Body_Ratio"]) <= config.star_body_ratio_max
+                and second_high_body <= float(first["Close"]) + setup_tolerance
+                and second_low_body <= float(first["Close"]) + setup_tolerance
+            )
+            if not setup_matches:
+                continue
+
+            midpoint = (float(first["Open"]) + float(first["Close"])) / 2.0
+            relevant_prices = {
+                "first_close": float(first["Close"]),
+                "star_open": float(second["Open"]),
+                "star_close": float(second["Close"]),
+                "star_low": float(second["Low"]),
+                "midpoint": midpoint,
+            }
+
+            if index == last_index:
+                # The third (recovery) candle has not completed yet -- retain this as a forming
+                # candidate so the next completed candle can confirm or invalidate it, rather than
+                # silently discarding a setup that is genuinely still in progress.
+                events.append(
+                    self._build_event(
+                        data,
+                        interval,
+                        index,
+                        pattern_start_index=first_index,
+                        relevant_indices=[first_index, index],
+                        relevant_prices=relevant_prices,
+                        detection_reason=(
+                            "A bearish impulse followed by a small-bodied star candle; this may be "
+                            "forming a morning star, but the next completed candle is needed to "
+                            "confirm or invalidate the bullish recovery."
+                        ),
+                        status=PatternStatus.CANDIDATE,
+                        bias="Neutral",
+                    )
+                )
+                continue
+
+            third_index = index + 1
+            if not _same_pattern_session(data, first_index, index, third_index, interval=interval):
+                continue
+            third = data.iloc[third_index]
             tolerance = _gap_tolerance(
                 float(first["Candle_Range"]),
                 float(second["Candle_Range"]),
                 float(third["Candle_Range"]),
                 ratio=config.gap_tolerance_ratio,
             )
-            midpoint = (float(first["Open"]) + float(first["Close"])) / 2.0
-            second_high_body = max(float(second["Open"]), float(second["Close"]))
-            second_low_body = min(float(second["Open"]), float(second["Close"]))
-            if not (
-                bool(first["Is_Bearish"])
-                and float(first["Body_Ratio"]) >= 0.45
-                and float(second["Body_Ratio"]) <= config.star_body_ratio_max
-                and second_high_body <= float(first["Close"]) + tolerance
+            confirmed = (
+                second_high_body <= float(first["Close"]) + tolerance
+                and second_low_body <= float(first["Close"]) + tolerance
                 and bool(third["Is_Bullish"])
                 and float(third["Close"]) >= midpoint
-                and second_low_body <= float(first["Close"]) + tolerance
-            ):
-                continue
-
-            events.append(
-                self._build_event(
-                    data,
-                    interval,
-                    index,
-                    pattern_start_index=index - 2,
-                    relevant_indices=[index - 2, index - 1, index],
-                    relevant_prices={
-                        "first_close": float(first["Close"]),
-                        "star_open": float(second["Open"]),
-                        "star_close": float(second["Close"]),
-                        "star_low": float(second["Low"]),
-                        "recovery_close": float(third["Close"]),
-                        "midpoint": midpoint,
-                    },
-                    detection_reason=(
-                        "A bearish impulse, small-bodied star, and bullish recovery above the "
-                        "first candle midpoint completed a morning star."
-                    ),
-                )
             )
+            relevant_prices["recovery_close"] = float(third["Close"])
+
+            if confirmed:
+                events.append(
+                    self._build_event(
+                        data,
+                        interval,
+                        third_index,
+                        pattern_start_index=first_index,
+                        relevant_indices=[first_index, index, third_index],
+                        relevant_prices=relevant_prices,
+                        detection_reason=(
+                            "A bearish impulse, small-bodied star, and bullish recovery above the "
+                            "first candle midpoint completed a morning star."
+                        ),
+                    )
+                )
+            else:
+                events.append(
+                    self._build_event(
+                        data,
+                        interval,
+                        third_index,
+                        pattern_start_index=first_index,
+                        relevant_indices=[first_index, index, third_index],
+                        relevant_prices=relevant_prices,
+                        detection_reason=(
+                            "The candle following a bearish impulse and small-bodied star failed to "
+                            "close above the first candle's midpoint, invalidating the forming "
+                            "morning star."
+                        ),
+                        status=PatternStatus.FAILED,
+                        bias="Neutral",
+                    )
+                )
         return events
 
 
@@ -1309,53 +1369,113 @@ class EveningStarDetector(BasePatternDetector):
 
     def detect(self, data: pd.DataFrame, config: PatternConfig, interval: str) -> list[PatternEvent]:
         events: list[PatternEvent] = []
-        for index in range(2, len(data)):
-            if not _same_pattern_session(data, index - 2, index - 1, index, interval=interval):
+        last_index = len(data) - 1
+        for index in range(1, len(data)):
+            first_index = index - 1
+            if not _same_pattern_session(data, first_index, index, interval=interval):
                 continue
-            first = data.iloc[index - 2]
-            second = data.iloc[index - 1]
-            third = data.iloc[index]
+            first = data.iloc[first_index]
+            second = data.iloc[index]
+            second_low_body = min(float(second["Open"]), float(second["Close"]))
+            second_high_body = max(float(second["Open"]), float(second["Close"]))
+            setup_tolerance = _gap_tolerance(
+                float(first["Candle_Range"]),
+                float(second["Candle_Range"]),
+                ratio=config.gap_tolerance_ratio,
+            )
+            setup_matches = (
+                bool(first["Is_Bullish"])
+                and float(first["Body_Ratio"]) >= 0.45
+                and float(second["Body_Ratio"]) <= config.star_body_ratio_max
+                and second_low_body >= float(first["Close"]) - setup_tolerance
+                and second_high_body >= float(first["Close"]) - setup_tolerance
+            )
+            if not setup_matches:
+                continue
+
+            midpoint = (float(first["Open"]) + float(first["Close"])) / 2.0
+            relevant_prices = {
+                "first_close": float(first["Close"]),
+                "star_open": float(second["Open"]),
+                "star_close": float(second["Close"]),
+                "star_high": float(second["High"]),
+                "midpoint": midpoint,
+            }
+
+            if index == last_index:
+                # The third (reversal) candle has not completed yet -- retain this as a forming
+                # candidate so the next completed candle can confirm or invalidate it, rather than
+                # silently discarding a setup that is genuinely still in progress.
+                events.append(
+                    self._build_event(
+                        data,
+                        interval,
+                        index,
+                        pattern_start_index=first_index,
+                        relevant_indices=[first_index, index],
+                        relevant_prices=relevant_prices,
+                        detection_reason=(
+                            "A bullish impulse followed by a small-bodied star candle; this may be "
+                            "forming an evening star, but the next completed candle is needed to "
+                            "confirm or invalidate the bearish reversal."
+                        ),
+                        status=PatternStatus.CANDIDATE,
+                        bias="Neutral",
+                    )
+                )
+                continue
+
+            third_index = index + 1
+            if not _same_pattern_session(data, first_index, index, third_index, interval=interval):
+                continue
+            third = data.iloc[third_index]
             tolerance = _gap_tolerance(
                 float(first["Candle_Range"]),
                 float(second["Candle_Range"]),
                 float(third["Candle_Range"]),
                 ratio=config.gap_tolerance_ratio,
             )
-            midpoint = (float(first["Open"]) + float(first["Close"])) / 2.0
-            second_low_body = min(float(second["Open"]), float(second["Close"]))
-            second_high_body = max(float(second["Open"]), float(second["Close"]))
-            if not (
-                bool(first["Is_Bullish"])
-                and float(first["Body_Ratio"]) >= 0.45
-                and float(second["Body_Ratio"]) <= config.star_body_ratio_max
-                and second_low_body >= float(first["Close"]) - tolerance
+            confirmed = (
+                second_low_body >= float(first["Close"]) - tolerance
+                and second_high_body >= float(first["Close"]) - tolerance
                 and bool(third["Is_Bearish"])
                 and float(third["Close"]) <= midpoint
-                and second_high_body >= float(first["Close"]) - tolerance
-            ):
-                continue
-
-            events.append(
-                self._build_event(
-                    data,
-                    interval,
-                    index,
-                    pattern_start_index=index - 2,
-                    relevant_indices=[index - 2, index - 1, index],
-                    relevant_prices={
-                        "first_close": float(first["Close"]),
-                        "star_open": float(second["Open"]),
-                        "star_close": float(second["Close"]),
-                        "star_high": float(second["High"]),
-                        "reversal_close": float(third["Close"]),
-                        "midpoint": midpoint,
-                    },
-                    detection_reason=(
-                        "A bullish impulse, small-bodied star, and bearish reversal below the "
-                        "first candle midpoint completed an evening star."
-                    ),
-                )
             )
+            relevant_prices["reversal_close"] = float(third["Close"])
+
+            if confirmed:
+                events.append(
+                    self._build_event(
+                        data,
+                        interval,
+                        third_index,
+                        pattern_start_index=first_index,
+                        relevant_indices=[first_index, index, third_index],
+                        relevant_prices=relevant_prices,
+                        detection_reason=(
+                            "A bullish impulse, small-bodied star, and bearish reversal below the "
+                            "first candle midpoint completed an evening star."
+                        ),
+                    )
+                )
+            else:
+                events.append(
+                    self._build_event(
+                        data,
+                        interval,
+                        third_index,
+                        pattern_start_index=first_index,
+                        relevant_indices=[first_index, index, third_index],
+                        relevant_prices=relevant_prices,
+                        detection_reason=(
+                            "The candle following a bullish impulse and small-bodied star failed to "
+                            "close below the first candle's midpoint, invalidating the forming "
+                            "evening star."
+                        ),
+                        status=PatternStatus.FAILED,
+                        bias="Neutral",
+                    )
+                )
         return events
 
 
