@@ -357,7 +357,7 @@ def test_interactive_never_reaches_timeframe_menu_on_invalid_ticker(
 
     assert exit_code == ExitCode.SUCCESS
     assert captured.out.count(NO_MATCHING_STOCK_MESSAGE) == 1
-    assert captured.out.count("Selected timeframe: One day (1_DAY)") == 1
+    assert captured.out.count("Selected timeframe: Daily (candle interval 1d, lookback 6 months (6mo))") == 1
     assert (captured_kwargs["period"], captured_kwargs["interval"]) == ("6mo", "1d")
 
 
@@ -546,7 +546,7 @@ def test_timeframe_combined_with_period_raises_configuration_error(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     exit_code = main(
-        ["analyze", "AAPL", "--timeframe", "1_MONTH", "--period", "3mo"],
+        ["analyze", "AAPL", "--timeframe", "MONTHLY", "--period", "3mo"],
         analyzer=offline_analyzer,
     )
     captured = capsys.readouterr()
@@ -559,7 +559,7 @@ def test_timeframe_combined_with_interval_raises_configuration_error(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     exit_code = main(
-        ["analyze", "AAPL", "--timeframe", "1_MONTH", "--interval", "1d"],
+        ["analyze", "AAPL", "--timeframe", "MONTHLY", "--interval", "1d"],
         analyzer=offline_analyzer,
     )
     captured = capsys.readouterr()
@@ -587,7 +587,7 @@ def test_timeframe_combines_with_as_of_for_look_back_testing() -> None:
             "analyze",
             "AAPL",
             "--timeframe",
-            "1_DAY",
+            "DAILY",
             "--as-of",
             "2026-07-10T16:46:00-04:00",
             "--format",
@@ -627,7 +627,7 @@ def test_ticker_flag_is_equivalent_to_positional_identifier() -> None:
         return {"symbol": symbol}
 
     exit_code = main(
-        ["analyze", "--ticker", "PYPL", "--timeframe", "1_DAY", "--format", "json"],
+        ["analyze", "--ticker", "PYPL", "--timeframe", "DAILY", "--format", "json"],
         analyzer=capturing_analyzer,
         interactive=False,
     )
@@ -675,7 +675,7 @@ def test_interactive_run_prompts_for_timeframe_when_omitted(
     assert exit_code == ExitCode.SUCCESS
     assert prompts == [_timeframe_menu_text()]
     assert (captured_kwargs["period"], captured_kwargs["interval"]) == ("6mo", "1d")
-    assert "Selected timeframe: One day (1_DAY)" in captured.out
+    assert "Selected timeframe: Daily (candle interval 1d, lookback 6 months (6mo))" in captured.out
 
 
 def test_interactive_run_retries_on_invalid_timeframe_choice_until_valid(
@@ -706,7 +706,7 @@ def test_interactive_run_retries_on_invalid_timeframe_choice_until_valid(
     assert "Invalid choice: ''. Please enter a number from 1 to 3." in captured.out
     assert "Invalid choice: '0'. Please enter a number from 1 to 3." in captured.out
     assert "Invalid choice: '4'. Please enter a number from 1 to 3." in captured.out
-    assert "Selected timeframe: One month (1_MONTH)" in captured.out
+    assert "Selected timeframe: Monthly (candle interval 1mo, lookback 10 years (10y))" in captured.out
 
 
 def test_interactive_run_never_raises_on_invalid_timeframe_input() -> None:
@@ -741,7 +741,7 @@ def test_interactive_run_does_not_prompt_when_timeframe_flag_given() -> None:
         raise AssertionError(f"input_fn should not be called, got prompt: {prompt!r}")
 
     exit_code = main(
-        ["analyze", "AAPL", "--timeframe", "1_WEEK", "--format", "json"],
+        ["analyze", "AAPL", "--timeframe", "WEEKLY", "--format", "json"],
         input_fn=unexpected_input,
         analyzer=capturing_analyzer,
         interactive=True,
@@ -1023,3 +1023,62 @@ def test_legacy_root_modules_remain_importable_but_clearly_deprecated() -> None:
     assert "deprecated compatibility wrapper" in (legacy_model.__doc__ or "").lower()
     assert callable(legacy_features.add_features)
     assert callable(legacy_model.analyze_stock)
+
+
+def test_timeframe_menu_lists_daily_weekly_monthly() -> None:
+    menu = _timeframe_menu_text()
+
+    assert "1) Daily" in menu
+    assert "2) Weekly" in menu
+    assert "3) Monthly" in menu
+    assert "One day" not in menu
+    assert "One week" not in menu
+    assert "One month" not in menu
+
+
+@pytest.mark.parametrize(
+    "argument,expected_timeframe,expected",
+    [
+        ("DAILY", "DAILY", ("6mo", "1d")),
+        ("weekly", "WEEKLY", ("5y", "1wk")),
+        ("Monthly", "MONTHLY", ("10y", "1mo")),
+        # Names used before the rename keep working.
+        ("1_DAY", "DAILY", ("6mo", "1d")),
+        ("1_WEEK", "WEEKLY", ("5y", "1wk")),
+        ("1_MONTH", "MONTHLY", ("10y", "1mo")),
+    ],
+)
+def test_timeframe_argument_accepts_new_and_legacy_names(
+    argument: str, expected_timeframe: str, expected: tuple[str, str]
+) -> None:
+    captured_kwargs: dict[str, object] = {}
+
+    def capturing_analyzer(symbol: str, **kwargs) -> dict:
+        captured_kwargs.update(kwargs)
+        return {"symbol": symbol}
+
+    exit_code = main(
+        ["analyze", "AAPL", "--timeframe", argument, "--format", "json"],
+        analyzer=capturing_analyzer,
+        interactive=False,
+    )
+
+    assert exit_code == ExitCode.SUCCESS
+    assert (captured_kwargs["period"], captured_kwargs["interval"]) == expected
+    assert captured_kwargs["timeframe"].value == expected_timeframe
+
+
+def test_manual_period_and_interval_do_not_forward_a_timeframe() -> None:
+    captured_kwargs: dict[str, object] = {}
+
+    def capturing_analyzer(symbol: str, **kwargs) -> dict:
+        captured_kwargs.update(kwargs)
+        return {"symbol": symbol}
+
+    main(
+        ["analyze", "AAPL", "--period", "5d", "--interval", "15m", "--format", "json"],
+        analyzer=capturing_analyzer,
+        interactive=False,
+    )
+
+    assert "timeframe" not in captured_kwargs

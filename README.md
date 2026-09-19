@@ -104,7 +104,7 @@ python3 main.py AAPL
 named flags:
 
 ```bash
-python3 main.py --ticker AAPL --timeframe 1_DAY
+python3 main.py --ticker AAPL --timeframe DAILY
 ```
 
 Providing both the positional identifier and `--ticker` at the same time is a
@@ -185,17 +185,57 @@ python3 -m stock_pattern_model analyze AAPL --as-of 2026-07-10T16:46:00-04:00
 Choose a preset analysis timeframe instead of manual `--period`/`--interval`:
 
 ```bash
-python3 -m stock_pattern_model analyze AAPL --timeframe 1_DAY
+python3 -m stock_pattern_model analyze AAPL --timeframe DAILY
 ```
 
-`--timeframe` selects the candle size and a lookback long enough to contain many candles of
-that size (it is not the span of time analyzed):
+A timeframe is the duration of **one candle** (a trading day, a trading week, or a trading month),
+not the amount of history that is analyzed. Each timeframe also carries the historical lookback and
+the trend windows that make that candle size meaningful. All of these values live in one place,
+`stock_pattern_model/timeframes.py`:
 
-| Timeframe   | Period | Interval |
-|-------------|--------|----------|
-| `1_DAY`     | `6mo`  | `1d`     |
-| `1_WEEK`    | `5y`   | `1wk`    |
-| `1_MONTH`   | `10y`  | `1mo`    |
+| Timeframe | One candle is     | Interval | Historical lookback                           | Trend windows short / medium / long | Local trend window |
+|-----------|-------------------|----------|-----------------------------------------------|-------------------------------------|--------------------|
+| `DAILY`   | one trading day   | `1d`     | `6mo` (about 125 completed candles)           | 10 / 50 / 100 candles               | 20 candles         |
+| `WEEKLY`  | one trading week  | `1wk`    | `5y` (about 260 completed candles)            | 8 / 26 / 104 candles                | 13 candles         |
+| `MONTHLY` | one trading month | `1mo`    | `10y` (about 120 completed candles), `max` if too few | 6 / 24 / 60 candles        | 12 candles         |
+
+The former names `1_DAY`, `1_WEEK` and `1_MONTH` are still accepted (case-insensitive).
+
+Only **completed** candles are analyzed. Completion is decided with the security's exchange
+calendar and timezone (`exchange_calendars`), so weekends, exchange holidays, early closes and
+daylight-saving changes (US and Israel) are handled:
+
+* Daily: today's candle is excluded until the session has closed (16:00 ET for NASDAQ, 13:00 ET on
+  an early-close day).
+* Weekly: the current week is excluded until its final *trading* session has ended (Thursday when
+  Friday is a holiday).
+* Monthly: the current month is excluded until its final trading session has ended.
+
+Price, trend, patterns, scoring and lifecycle all use the same latest completed candle. Pattern
+age, expiration, confirmation and invalidation are counted in candles, never in calendar days.
+When no exchange calendar is known (for example an offline `--data-file` without an exchange), a
+weekday-based fallback is used and a warning says so.
+
+A trend window that needs more completed candles than are available is reported as
+`Insufficient Data` (its score is `null` in JSON) and left out of the composite trend, with a
+warning; the other windows are still computed.
+
+The text output shows the timeframe details and the completed candle by date:
+
+```text
+Timeframe: Weekly
+Candle Interval: 1wk
+Historical Lookback: 5 years (5y)
+Completed Candles Used: 259
+Latest Completed Trading Week: 2026-09-08 to 2026-09-11
+Exchange Timezone: America/New_York
+Display Timezone: Asia/Jerusalem
+Analysis Time: 2026-09-16 19:00:00+0300 Asia/Jerusalem
+```
+
+Daily shows `Latest Completed Trading Session: YYYY-MM-DD` and Monthly shows
+`Latest Completed Trading Month: YYYY-MM`. Dates are exchange-local; a daily candle is never turned
+into a made-up clock time.
 
 For intraday candles (for example 15-minute bars), pass `--period` and `--interval` manually, such as
 `--period 1mo --interval 15m`.
@@ -205,26 +245,26 @@ configuration error. Combine `--timeframe` with `--as-of` to look back to a past
 point in time (for example, running analysis every evening for testing).
 
 If `--timeframe`, `--period`, and `--interval` are all omitted, the CLI prompts
-you to choose one of the three timeframe presets by number instead of silently
+you to choose one of the three timeframes by number instead of silently
 defaulting to `1mo`/`15m`:
 
 ```text
 Enter a ticker or Israeli security number:
-Choose a timeframe:
+Choose a timeframe (the duration of one candle):
 
-1) One day
-2) One week
-3) One month
+1) Daily
+2) Weekly
+3) Monthly
 
 Enter your choice (1-3):
 ```
 
 Entering a number outside 1-3, non-numeric text, or an empty value prints an
 error and re-shows the menu; it never crashes or exits the program. A valid
-selection echoes both the readable label and the internal value it maps to,
-for example `Selected timeframe: One day (1_DAY)`. This numbered menu
-is interactive-only and has no effect on `--timeframe`, which still takes the
-internal value directly (`--timeframe 1_DAY`) for scripted/CLI usage.
+selection echoes the label, candle interval and lookback, for example
+`Selected timeframe: Daily (candle interval 1d, lookback 6 months (6mo))`. This numbered menu
+is interactive-only and has no effect on `--timeframe`, which takes the name directly
+(`--timeframe DAILY`) for scripted/CLI usage.
 
 This means plain, no-flag invocations always prompt for both the instrument and
 the timeframe:
@@ -245,11 +285,11 @@ ticker, or supply `--timeframe`/`--period`/`--interval` directly:
 
 ```bash
 python3 -m stock_pattern_model analyze AAPL --no-interactive
-python3 -m stock_pattern_model analyze AAPL --timeframe 1_DAY
+python3 -m stock_pattern_model analyze AAPL --timeframe DAILY
 ```
 
 ```bash
-python3 -m stock_pattern_model analyze AAPL --timeframe 1_DAY --as-of 2026-08-14T23:59:00+03:00
+python3 -m stock_pattern_model analyze AAPL --timeframe DAILY --as-of 2026-08-14T23:59:00+03:00
 ```
 
 ### Ticker Validation

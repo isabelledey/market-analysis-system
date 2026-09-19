@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import yfinance as yf
 
+from stock_pattern_model.candle_timing import CandleClock
 from stock_pattern_model.config import MarketDataConfig
 from stock_pattern_model.context import AnalysisContext, build_analysis_context
 from stock_pattern_model.datetime_utils import interval_to_timedelta
@@ -278,8 +279,16 @@ def validate_market_data(
         normalized_as_of = pd.Timestamp(as_of)
         if normalized_as_of.tzinfo is None:
             raise DataValidationError("as_of must be timezone-aware.")
-        completed_row_count = int(
-            (validated_df["Datetime"] + interval_to_timedelta(interval) <= normalized_as_of).sum()
+        clock = CandleClock(
+            interval,
+            exchange_timezone=effective_exchange_timezone,
+            exchange_calendar=context.exchange_calendar if context is not None else None,
+            regular_session_end=effective_regular_session_end,
+        )
+        completed_row_count = (
+            int((clock.bar_ends(validated_df["Datetime"]) <= normalized_as_of).sum())
+            if len(validated_df)
+            else 0
         )
 
     report = DataQualityReport(

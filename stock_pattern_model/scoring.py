@@ -493,6 +493,8 @@ class ScoringService:
         latest_bar_end_display: str,
         interval: str,
         latest_volume_baseline_source: str,
+        latest_candle_description: str | None = None,
+        local_trend_label: str = "session",
     ) -> dict[str, Any]:
         enriched_patterns = self._enrich_patterns(patterns, interval)
         score_patterns = [pattern for pattern in enriched_patterns if pattern["score_eligible"]]
@@ -540,6 +542,8 @@ class ScoringService:
             latest_bar_end_display=latest_bar_end_display,
             interval=interval,
             latest_volume_baseline_source=latest_volume_baseline_source,
+            latest_candle_description=latest_candle_description,
+            local_trend_label=local_trend_label,
             display_timezone=display_timezone,
             score=score,
             rule_confidence=rule_confidence,
@@ -1172,6 +1176,8 @@ class ScoringService:
         display_timezone: str,
         score: dict[str, float],
         rule_confidence: float,
+        latest_candle_description: str | None = None,
+        local_trend_label: str = "session",
     ) -> dict[str, Any]:
         bullish_patterns = [
             pattern for pattern in primary_patterns
@@ -1327,14 +1333,22 @@ class ScoringService:
         if trend_horizon:
             trend_clause = f"{trend_clause} Trend horizon: {trend_horizon}."
         if local_trend:
-            local_trend_clause = f" Local session trend: {local_trend}."
+            local_trend_clause = f" Local {local_trend_label} trend: {local_trend}."
             if local_trend_score is not None:
-                local_trend_clause = f" Local session trend: {local_trend} (score {local_trend_score:.2f})."
+                local_trend_clause = (
+                    f" Local {local_trend_label} trend: {local_trend} (score {local_trend_score:.2f})."
+                )
             trend_clause = f"{trend_clause}{local_trend_clause}"
 
+        if latest_candle_description:
+            candle_clause = f"on the completed {latest_candle_description}"
+        else:
+            candle_clause = (
+                f"on the completed {interval} candle from "
+                f"{latest_bar_start_display} to {latest_bar_end_display}"
+            )
         summary = (
-            f"{symbol} last traded at {latest_close:.2f} on the completed {interval} candle from "
-            f"{latest_bar_start_display} to {latest_bar_end_display}. {trend_clause} "
+            f"{symbol} last traded at {latest_close:.2f} {candle_clause}. {trend_clause} "
             f"Market state: {market_state}. Overall bias: {overall_bias}. "
             f"Net signal score: {score['net_signal_score']:.2f}. Rule confidence: {rule_confidence:.1f}/100."
         )

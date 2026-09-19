@@ -9,6 +9,7 @@ from typing import Protocol
 import numpy as np
 import pandas as pd
 
+from stock_pattern_model.candle_timing import bar_end_from_frame
 from stock_pattern_model.config import PatternConfig
 from stock_pattern_model.datetime_utils import interval_to_timedelta
 from stock_pattern_model.domain import PatternEvent, PatternFamily, PatternStatus
@@ -17,10 +18,6 @@ from stock_pattern_model.session_utils import pattern_session_key_series
 
 def _get_bar_timedelta(interval: str) -> pd.Timedelta:
     return interval_to_timedelta(interval)
-
-
-def _get_bar_end(timestamp: pd.Timestamp, interval: str) -> pd.Timestamp:
-    return timestamp + _get_bar_timedelta(interval)
 
 
 def _get_exchange_timezone(data: pd.DataFrame) -> str:
@@ -412,25 +409,17 @@ class BasePatternDetector:
         detected_bar_index = final_index if detected_at_index is None else detected_at_index
         pattern_end_bar_index = final_index if pattern_end_index is None else pattern_end_index
         bar_start_at = pd.Timestamp(data.iloc[final_bar_index]["Datetime"])
-        bar_end_at = _get_bar_end(bar_start_at, interval)
-        detected_bar_start = pd.Timestamp(data.iloc[detected_bar_index]["Datetime"])
-        detected_at = _get_bar_end(detected_bar_start, interval)
+        bar_end_at = bar_end_from_frame(data, final_bar_index, interval)
+        detected_at = bar_end_from_frame(data, detected_bar_index, interval)
         pattern_start_at = pd.Timestamp(data.iloc[pattern_start_index]["Datetime"])
-        pattern_end_start = pd.Timestamp(data.iloc[pattern_end_bar_index]["Datetime"])
-        pattern_end_at = _get_bar_end(pattern_end_start, interval)
+        pattern_end_at = bar_end_from_frame(data, pattern_end_bar_index, interval)
         setup_completion_bar_index = (
             pattern_end_bar_index if setup_completion_index is None else setup_completion_index
         )
-        setup_completion_at = _get_bar_end(
-            pd.Timestamp(data.iloc[setup_completion_bar_index]["Datetime"]),
-            interval,
-        )
+        setup_completion_at = bar_end_from_frame(data, setup_completion_bar_index, interval)
         confirmation_at = None
         if confirmation_index is not None:
-            confirmation_at = _get_bar_end(
-                pd.Timestamp(data.iloc[confirmation_index]["Datetime"]),
-                interval,
-            )
+            confirmation_at = bar_end_from_frame(data, confirmation_index, interval)
         exchange_timezone = _get_exchange_timezone(data)
         row = data.iloc[final_bar_index]
         return PatternEvent(
@@ -1942,6 +1931,15 @@ class _BreakStructureEvent:
     base_score: float
 
 
+_INSUFFICIENT_DATA_LABEL = "Insufficient Data"
+_INSUFFICIENT_TREND_SNAPSHOT = _TrendSnapshot(
+    score=0.0,
+    label=_INSUFFICIENT_DATA_LABEL,
+    evidence=[],
+    evidence_items=[],
+)
+
+
 def _trend_horizons(lookback_bars: int) -> tuple[int, int, int]:
     short_horizon = max(12, min(20, lookback_bars))
     medium_horizon = max(40, min(60, short_horizon * 4))
@@ -2218,8 +2216,9 @@ def _trend_snapshot_from_arrays(
     breakout_lookback: int,
     raw_break_score: float,
     horizon_label: str = "Composite",
+    min_bars: int = 8,
 ) -> _TrendSnapshot:
-    if len(closes) < 8:
+    if len(closes) < min_bars:
         return _TrendSnapshot(score=0.0, label="Neutral", evidence=[], evidence_items=[])
 
     atr_scale = float(np.nanmean(highs - lows))
@@ -2460,10 +2459,22 @@ def classify_intraday_trend(
     pivot_left_bars: int = 2,
     pivot_right_bars: int = 2,
     breakout_lookback: int = 20,
+    horizons: tuple[int, int, int] | None = None,
 ) -> pd.DataFrame:
-    """Classify the intraday trend using recency-aware structural components."""
+    """Classify the trend using recency-aware structural components.
+
+    ``horizons`` (short, medium, long, in completed candles) selects the timeframe-specific
+    windows from ``stock_pattern_model.timeframes``. With explicit horizons a window is only
+    evaluated once that many completed candles exist; until then that horizon is reported as
+    "Insufficient Data" and excluded from the composite (which is "Insufficient Data" itself when
+    not even the short window is available), instead of silently using a shorter window.
+    Without ``horizons`` the original behaviour (windows derived from ``lookback_bars``) is kept.
+    """
     pattern_df = df.copy()
-    short_horizon, medium_horizon, long_horizon = _trend_horizons(lookback_bars)
+    strict_horizons = horizons is not None
+    short_horizon, medium_horizon, long_horizon = (
+        horizons if horizons is not None else _trend_horizons(lookback_bars)
+    )
     close_values = pattern_df["Close"].astype(float).to_numpy(copy=False)
     high_values = pattern_df["High"].astype(float).to_numpy(copy=False)
     low_values = pattern_df["Low"].astype(float).to_numpy(copy=False)
@@ -2484,6 +2495,7 @@ def classify_intraday_trend(
     trend_evidence_structured: list[list[dict[str, object]]] = []
     trend_horizons: list[str] = []
     trend_lookbacks: list[int] = []
+    insufficient_horizon_names: list[list[str]] = []
 
     for index in range(len(pattern_df)):
         def build_snapshot(horizon: int, index: int = index) -> _TrendSnapshot:
@@ -2507,11 +2519,17 @@ def classify_intraday_trend(
                     if horizon == short_horizon
                     else ("Medium-term" if horizon == medium_horizon else "Long-term")
                 ),
+                min_bars=min(8, horizon),
             )
 
-        short_snapshot = build_snapshot(short_horizon)
-        medium_snapshot = build_snapshot(medium_horizon)
-        long_snapshot = build_snapshot(long_horizon)
+        def snapshot_for(horizon: int, index: int = index) -> _TrendSnapshot:
+            if strict_horizons and (index + 1) < horizon:
+                return _INSUFFICIENT_TREND_SNAPSHOT
+            return build_snapshot(horizon, index)
+
+        short_snapshot = snapshot_for(short_horizon)
+        medium_snapshot = snapshot_for(medium_horizon)
+        long_snapshot = snapshot_for(long_horizon)
 
         weights: list[float] = []
         weighted_scores: list[float] = []
@@ -2521,12 +2539,25 @@ def classify_intraday_trend(
             (long_snapshot, 0.15, long_horizon),
         )
         for snapshot, weight, horizon in available_snapshots:
-            if (index + 1) >= min(8, horizon):
+            if (index + 1) >= (horizon if strict_horizons else min(8, horizon)):
                 weights.append(weight)
                 weighted_scores.append(snapshot.score * weight)
 
         composite_score = round(sum(weighted_scores) / sum(weights), 2) if weights else 0.0
-        composite_label = _trend_label(composite_score)
+        composite_label = (
+            _INSUFFICIENT_DATA_LABEL
+            if strict_horizons and not weights
+            else _trend_label(composite_score)
+        )
+        insufficient_names = [
+            name
+            for name, snapshot in (
+                ("short", short_snapshot),
+                ("medium", medium_snapshot),
+                ("long", long_snapshot),
+            )
+            if snapshot is _INSUFFICIENT_TREND_SNAPSHOT
+        ]
         structured_evidence: list[dict[str, object]] = []
         for snapshot in (short_snapshot, medium_snapshot, long_snapshot):
             for item in snapshot.evidence_items:
@@ -2554,7 +2585,12 @@ def classify_intraday_trend(
                 "evaluation_index": int(index),
                 "supports_composite_trend": False,
                 "conflicts_with_composite_trend": False,
-                "explanation": "Slope, moving averages, swing structure, and recent breaks were too mixed to confirm a trend.",
+                "explanation": (
+                    f"Only {index + 1} completed candle(s) were available, fewer than the "
+                    f"{short_horizon} needed for the shortest trend horizon."
+                    if composite_label == _INSUFFICIENT_DATA_LABEL
+                    else "Slope, moving averages, swing structure, and recent breaks were too mixed to confirm a trend."
+                ),
             }
             structured_evidence.append(neutral_item)
             evidence = [f"[Composite, Neutral] {neutral_item['explanation']}"]
@@ -2571,6 +2607,7 @@ def classify_intraday_trend(
         trend_evidence_structured.append(structured_evidence)
         trend_horizons.append("Short-to-medium term")
         trend_lookbacks.append(medium_horizon)
+        insufficient_horizon_names.append(insufficient_names)
 
     pattern_df["Short_Term_Trend"] = short_labels
     pattern_df["Medium_Term_Trend"] = medium_labels
@@ -2584,6 +2621,7 @@ def classify_intraday_trend(
     pattern_df["Trend_Evidence_Structured"] = trend_evidence_structured
     pattern_df["Trend_Horizon"] = trend_horizons
     pattern_df["Trend_Lookback_Bars"] = trend_lookbacks
+    pattern_df["Trend_Insufficient_Horizons"] = insufficient_horizon_names
     return pattern_df
 
 

@@ -20,6 +20,34 @@ def _pattern_entry_move_display(pattern_entry_trend: str | None) -> str | None:
     return _PATTERN_ENTRY_MOVE_LABELS.get(pattern_entry_trend, pattern_entry_trend)
 
 
+def _score_text(score: Any) -> str:
+    """Trend scores are ``None`` when the horizon needs more completed candles than available."""
+    return "Not Available" if score is None else str(score)
+
+
+def _trend_horizon_line(result: dict[str, Any], key: str, title: str) -> str:
+    candles = (result.get("trend_horizon_candles") or {}).get(key)
+    window = f", {candles} candles" if candles else ""
+    return (
+        f"{title}: {result.get(f'{key}_term_trend', 'Unknown')} "
+        f"({_score_text(result.get(f'{key}_term_trend_score', 'Unknown'))}{window})"
+    )
+
+
+def _timeframe_lines(result: dict[str, Any]) -> list[str]:
+    """Timeframe/candle header shown for daily, weekly, and monthly analyses."""
+    latest = result.get("latest_completed_candle") or {}
+    lines = [
+        f"Timeframe: {result.get('timeframe_label') or result.get('timeframe')}",
+        f"Candle Interval: {result.get('candle_interval', result.get('interval', 'Unknown'))}",
+        f"Historical Lookback: {result.get('historical_lookback_display') or 'Unknown'}",
+        f"Completed Candles Used: {result.get('completed_candles_used', 'Unknown')}",
+    ]
+    if latest:
+        lines.append(f"{latest.get('label', 'Latest Completed Candle')}: {latest.get('value', 'Unknown')}")
+    return lines
+
+
 def _append_pattern_candle_lines(lines: list[str], pattern: dict[str, Any], *, indent: str) -> None:
     candle = pattern.get("pattern_candle")
     if not candle:
@@ -89,21 +117,31 @@ def format_analysis_text(
         f"Exchange: {instrument.get('exchange') or 'Unknown'}",
         f"Exchange Calendar: {result.get('exchange_calendar') or 'Unknown'}",
         f"Currency: {instrument.get('currency') or 'Unknown'}",
-        f"Interval: {result.get('interval', 'Unknown')}",
+        *(
+            _timeframe_lines(result)
+            if result.get("timeframe")
+            else [f"Interval: {result.get('interval', 'Unknown')}"]
+        ),
         f"Analysis Time: {result.get('analysis_time', result.get('as_of', 'Unknown'))}",
         f"Exchange Timezone: {result.get('exchange_timezone') or 'Unknown'}",
         f"Display Timezone: {result.get('display_timezone') or 'Unknown'}",
         f"Session Mode: {result.get('session_mode') or 'Unknown'}",
         f"Included Segments: {', '.join(result.get('included_segments', [])) or 'Unknown'}",
         f"Excluded Segments: {', '.join(result.get('excluded_segments', [])) or 'None'}",
-        f"Latest Completed Candle Start: {result.get('latest_bar_start', 'Unknown')}",
-        f"Latest Completed Candle End: {result.get('latest_bar_end', 'Unknown')}",
+        *(
+            []
+            if result.get("latest_completed_candle")
+            else [
+                f"Latest Completed Candle Start: {result.get('latest_bar_start', 'Unknown')}",
+                f"Latest Completed Candle End: {result.get('latest_bar_end', 'Unknown')}",
+            ]
+        ),
         f"Latest Close: {result.get('latest_close', 'Unknown')}",
         f"Data Quality: {result.get('data_quality_report', {}).get('completed_row_count', 'Unknown')} "
         f"completed rows / {result.get('data_quality_report', {}).get('row_count', 'Unknown')} total rows",
         f"Trend: {result.get('trend', 'Unknown')}",
         f"Broad Trend: {result.get('broad_trend', result.get('trend', 'Unknown'))}",
-        f"Local Session Trend: {result.get('local_trend', 'Unknown')} "
+        f"Local {'Window' if result.get('timeframe') else 'Session'} Trend: {result.get('local_trend', 'Unknown')} "
         f"({result.get('local_trend_score', 'Unknown')}, "
         f"lookback {result.get('local_trend_lookback_bars', 'Unknown')} bars)",
         f"Latest Candle Direction: {result.get('latest_candle_direction', 'Unknown')} "
@@ -119,9 +157,9 @@ def format_analysis_text(
         f"Pattern Score: {result.get('pattern_score', 'Unknown')}",
         f"Volume Score: {result.get('volume_score', 'Unknown')}",
         f"Net Signal Score: {result.get('net_signal_score', 'Unknown')}",
-        f"Short-Term Trend: {result.get('short_term_trend', 'Unknown')} ({result.get('short_term_trend_score', 'Unknown')})",
-        f"Medium-Term Trend: {result.get('medium_term_trend', 'Unknown')} ({result.get('medium_term_trend_score', 'Unknown')})",
-        f"Long-Term Trend: {result.get('long_term_trend', 'Unknown')} ({result.get('long_term_trend_score', 'Unknown')})",
+        _trend_horizon_line(result, "short", "Short-Term Trend"),
+        _trend_horizon_line(result, "medium", "Medium-Term Trend"),
+        _trend_horizon_line(result, "long", "Long-Term Trend"),
         f"Current Score-Contributing Evidence Count: {len(current_contributing)}",
         f"Score-Contributing Bullish Evidence Count: {result.get('score_contributing_bullish_count', 0)}",
         f"Score-Contributing Bearish Evidence Count: {result.get('score_contributing_bearish_count', 0)}",

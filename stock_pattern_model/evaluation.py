@@ -10,9 +10,13 @@ from typing import Any
 import pandas as pd
 
 from stock_pattern_model.analysis import analyze_dataframe
+from stock_pattern_model.candle_timing import (
+    BAR_END_COLUMN,
+    CandleClock,
+    bar_end_from_frame,
+)
 from stock_pattern_model.config import HistoricalEvaluationConfig, MarketDataConfig
 from stock_pattern_model.context import build_analysis_context
-from stock_pattern_model.datetime_utils import interval_to_timedelta
 from stock_pattern_model.domain import (
     DataQualityReport,
     HistoricalEvaluationResult,
@@ -37,14 +41,6 @@ from stock_pattern_model.session_utils import (
     DEFAULT_REGULAR_SESSION_START,
     session_segment_series,
 )
-
-
-def _get_bar_timedelta(interval: str) -> pd.Timedelta:
-    return interval_to_timedelta(interval)
-
-
-def _get_bar_end(timestamp: pd.Timestamp, interval: str) -> pd.Timestamp:
-    return timestamp + _get_bar_timedelta(interval)
 
 
 def _normalize_as_of(as_of: pd.Timestamp | None) -> pd.Timestamp:
@@ -82,13 +78,16 @@ def _filter_completed_candles(
     *,
     interval: str,
     as_of: pd.Timestamp | None,
+    clock: CandleClock | None = None,
 ) -> tuple[pd.DataFrame, pd.Timestamp]:
+    """Keep completed candles only; ``Bar_End`` (exchange-calendar aware) stays on the frame."""
     normalized_as_of = _normalize_as_of(as_of)
     filtered_df = df.copy()
     filtered_df["Datetime"] = pd.to_datetime(filtered_df["Datetime"])
-    filtered_df["Bar_End"] = filtered_df["Datetime"] + _get_bar_timedelta(interval)
-    filtered_df = filtered_df.loc[filtered_df["Bar_End"] <= normalized_as_of].copy()
-    filtered_df = filtered_df.drop(columns=["Bar_End"]).reset_index(drop=True)
+    if not filtered_df.empty:
+        filtered_df[BAR_END_COLUMN] = (clock or CandleClock(interval)).bar_ends(filtered_df["Datetime"])
+        filtered_df = filtered_df.loc[filtered_df[BAR_END_COLUMN] <= normalized_as_of].copy()
+    filtered_df = filtered_df.reset_index(drop=True)
     if filtered_df.empty:
         raise DataValidationError(
             f"No completed {interval} candles are available for historical evaluation as of "
@@ -252,7 +251,7 @@ def _compute_outcomes_for_signal(
                 future_bar_count=int(horizon),
                 available=True,
                 exit_index=exit_index,
-                exit_at=_get_bar_end(pd.Timestamp(exit_row["Datetime"]), interval),
+                exit_at=bar_end_from_frame(history, exit_index, interval),
                 exit_close=round(exit_close, 6),
                 raw_forward_return=round(raw_forward_return, 6),
                 directional_forward_return=round(directional_forward_return, 6),
@@ -438,6 +437,12 @@ def _validate_and_prepare_history(
         validated_df,
         interval=interval,
         as_of=as_of,
+        clock=CandleClock(
+            interval,
+            exchange_timezone=context.exchange_timezone or exchange_timezone,
+            exchange_calendar=context.exchange_calendar,
+            regular_session_end=context.regular_session_end or regular_session_end,
+        ),
     )
     quality_report = replace(quality_report, completed_row_count=len(completed_df))
     return completed_df, quality_report, normalized_as_of
@@ -467,7 +472,7 @@ def _collect_signal_records(
             continue
 
         prefix_df = history.iloc[: index + 1].copy()
-        prefix_as_of = _get_bar_end(pd.Timestamp(prefix_df.iloc[-1]["Datetime"]), interval)
+        prefix_as_of = bar_end_from_frame(history, index, interval)
         result = analyze_dataframe(
             df=prefix_df,
             symbol=symbol,

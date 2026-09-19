@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -16,6 +19,43 @@ _INTERVAL_TIMEDELTA_ALIASES = {
     "1mo": "30D",
     "3mo": "90D",
 }
+
+
+# While an analysis of daily/weekly/monthly candles runs, user-facing candle timestamps are shown
+# as dates ("2026-09-18", "2026-09", ...) in the exchange timezone. A date-only candle has no
+# meaningful time of day, and converting its exchange-local midnight into the display timezone
+# would print an artificial hour such as "07:00 Asia/Jerusalem". The scope is set by
+# analysis.analyze_dataframe; ``exact=True`` opts a value (e.g. the analysis time) out.
+_CANDLE_DISPLAY_SCOPE: ContextVar[tuple[str, str | None] | None] = ContextVar(
+    "candle_display_scope",
+    default=None,
+)
+
+
+@contextmanager
+def candle_display_scope(span: str | None, exchange_timezone: str | None) -> Iterator[None]:
+    """Render candle timestamps as exchange-local dates for 'session'/'week'/'month' candles."""
+    token = _CANDLE_DISPLAY_SCOPE.set((span, exchange_timezone) if span else None)
+    try:
+        yield
+    finally:
+        _CANDLE_DISPLAY_SCOPE.reset(token)
+
+
+def format_candle_date(value: Any, span: str, exchange_timezone: str | ZoneInfo | None = None) -> str:
+    """Format a candle timestamp as its exchange-local date ('YYYY-MM' for monthly candles)."""
+    timestamp = ensure_timezone_aware(value)
+    if exchange_timezone is not None:
+        timestamp = convert_to_timezone(timestamp, exchange_timezone)
+    return timestamp.strftime("%Y-%m" if span == "month" else "%Y-%m-%d")
+
+
+def _scoped_candle_date(value: Any) -> str | None:
+    scope = _CANDLE_DISPLAY_SCOPE.get()
+    if scope is None:
+        return None
+    span, exchange_timezone = scope
+    return format_candle_date(value, span, exchange_timezone)
 
 
 def interval_to_timedelta(interval: str) -> pd.Timedelta:
@@ -61,8 +101,18 @@ def format_iso_timestamp(
 def format_display_datetime(
     value: Any,
     timezone: str | ZoneInfo,
+    *,
+    exact: bool = False,
 ) -> str:
-    """Format a user-facing timestamp with offset and timezone name."""
+    """Format a user-facing timestamp with offset and timezone name.
+
+    Inside a daily/weekly/monthly ``candle_display_scope`` candle timestamps are rendered as dates
+    instead, unless ``exact`` is set.
+    """
+    if not exact:
+        scoped = _scoped_candle_date(value)
+        if scoped is not None:
+            return scoped
     converted = convert_to_timezone(value, timezone)
     zone = to_zoneinfo(timezone)
     zone_name = getattr(zone, "key", str(zone))
@@ -72,8 +122,14 @@ def format_display_datetime(
 def format_compact_display_datetime(
     value: Any,
     timezone: str | ZoneInfo,
+    *,
+    exact: bool = False,
 ) -> str:
-    """Format a compact user-facing timestamp for explanations."""
+    """Format a compact user-facing timestamp for explanations (date-only inside a candle scope)."""
+    if not exact:
+        scoped = _scoped_candle_date(value)
+        if scoped is not None:
+            return scoped
     converted = convert_to_timezone(value, timezone)
     zone = to_zoneinfo(timezone)
     zone_name = getattr(zone, "key", str(zone))

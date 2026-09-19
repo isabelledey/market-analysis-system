@@ -12,11 +12,7 @@ from typing import Callable
 import pandas as pd
 
 from stock_pattern_model.analysis import analyze_stock
-from stock_pattern_model.config import (
-    SUPPORTED_INTERVALS,
-    SUPPORTED_TIMEFRAMES,
-    TIMEFRAME_TO_PERIOD_INTERVAL,
-)
+from stock_pattern_model.config import SUPPORTED_INTERVALS
 from stock_pattern_model.domain import ResolvedInstrument
 from stock_pattern_model.exceptions import (
     ConfigurationError,
@@ -34,6 +30,14 @@ from stock_pattern_model.formatters import format_analysis_json, format_analysis
 from stock_pattern_model.market_data import YFinanceProvider
 from stock_pattern_model.resolver import CsvInstrumentResolver
 from stock_pattern_model.session_utils import SUPPORTED_SESSION_MODES
+from stock_pattern_model.timeframes import (
+    SUPPORTED_TIMEFRAMES,
+    TIMEFRAME_SPECS,
+    TIMEFRAME_TO_PERIOD_INTERVAL,
+    Timeframe,
+    format_lookback_period,
+    parse_timeframe,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -80,51 +84,71 @@ def _validate_positive_int(value: int, flag_name: str) -> None:
         raise ConfigurationError(f"{flag_name} must be at least 1.")
 
 
-_TIMEFRAME_MENU: tuple[tuple[str, str, str], ...] = (
-    ("1", "1_DAY", "One day"),
-    ("2", "1_WEEK", "One week"),
-    ("3", "1_MONTH", "One month"),
+# The menu is generated from the central timeframe configuration: 1) Daily 2) Weekly 3) Monthly.
+_TIMEFRAME_MENU: tuple[tuple[str, Timeframe, str], ...] = tuple(
+    (str(number), timeframe, TIMEFRAME_SPECS[timeframe].label)
+    for number, timeframe in enumerate(Timeframe, start=1)
 )
 _TIMEFRAME_MENU_BY_NUMBER = {number: (value, label) for number, value, label in _TIMEFRAME_MENU}
 
 
 def _timeframe_menu_text() -> str:
-    lines = ["Choose a timeframe:", ""]
+    lines = ["Choose a timeframe (the duration of one candle):", ""]
     lines.extend(f"{number}) {label}" for number, _value, label in _TIMEFRAME_MENU)
-    lines.extend(["", "Enter your choice (1-3): "])
+    lines.extend(["", f"Enter your choice (1-{len(_TIMEFRAME_MENU)}): "])
     return "\n".join(lines)
 
 
-def _prompt_for_timeframe(input_fn: Callable[[str], str]) -> str:
+def _describe_selected_timeframe(timeframe: Timeframe) -> str:
+    spec = TIMEFRAME_SPECS[timeframe]
+    return (
+        f"{spec.label} (candle interval {spec.interval}, "
+        f"lookback {format_lookback_period(spec.lookback_period)})"
+    )
+
+
+def _prompt_for_timeframe(input_fn: Callable[[str], str]) -> Timeframe:
     menu_text = _timeframe_menu_text()
     while True:
         choice = input_fn(menu_text).strip()
         match = _TIMEFRAME_MENU_BY_NUMBER.get(choice)
         if match is not None:
-            value, label = match
-            print(f"Selected timeframe: {label} ({value})")
-            return value
-        print(f"Invalid choice: '{choice}'. Please enter a number from 1 to 3.\n")
+            timeframe, _label = match
+            print(f"Selected timeframe: {_describe_selected_timeframe(timeframe)}")
+            return timeframe
+        print(f"Invalid choice: '{choice}'. Please enter a number from 1 to {len(_TIMEFRAME_MENU)}.\n")
+
+
+def _timeframe_argument(value: str) -> str:
+    """Argparse ``type``: accepts Daily/Weekly/Monthly in any case plus the legacy 1_DAY/1_WEEK/1_MONTH."""
+    try:
+        return parse_timeframe(value).value
+    except ConfigurationError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
 
 
 def _resolve_period_and_interval(
     args: argparse.Namespace,
     input_fn: Callable[[str], str],
     interactive: bool,
-) -> tuple[str, str]:
+) -> tuple[str, str, Timeframe | None]:
+    """Return ``(period, interval, timeframe)``; ``timeframe`` is set only when a preset was chosen."""
     if args.timeframe is not None:
         if args.period is not None or args.interval is not None:
             raise ConfigurationError(
                 "--timeframe cannot be combined with --period or --interval. "
                 "Choose --timeframe alone, or set --period/--interval manually."
             )
-        return TIMEFRAME_TO_PERIOD_INTERVAL[args.timeframe]
+        timeframe = parse_timeframe(args.timeframe)
+        period, interval = TIMEFRAME_TO_PERIOD_INTERVAL[timeframe.value]
+        return period, interval, timeframe
     if args.period is not None or args.interval is not None:
-        return args.period or DEFAULT_PERIOD, args.interval or DEFAULT_INTERVAL
+        return args.period or DEFAULT_PERIOD, args.interval or DEFAULT_INTERVAL, None
     if interactive:
         timeframe = _prompt_for_timeframe(input_fn)
-        return TIMEFRAME_TO_PERIOD_INTERVAL[timeframe]
-    return DEFAULT_PERIOD, DEFAULT_INTERVAL
+        period, interval = TIMEFRAME_TO_PERIOD_INTERVAL[timeframe.value]
+        return period, interval, timeframe
+    return DEFAULT_PERIOD, DEFAULT_INTERVAL, None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -144,14 +168,16 @@ def build_parser() -> argparse.ArgumentParser:
     analyze_parser.add_argument("--period", default=None)
     analyze_parser.add_argument(
         "--timeframe",
+        type=_timeframe_argument,
         choices=SUPPORTED_TIMEFRAMES,
         default=None,
+        metavar="{DAILY,WEEKLY,MONTHLY}",
         help=(
-            "Preset candle size. Selects the candle/bar interval (1_DAY -> 1d, 1_WEEK -> 1wk, "
-            "1_MONTH -> 1mo) plus an independently-sized "
-            "historical lookback long enough to contain many candles of that size, not just one. "
-            "Cannot be combined with --period or --interval. Combine with --as-of to look back to "
-            "a past evening for testing."
+            "Duration of ONE candle, not the amount of history. DAILY -> 1d candles (6 months of "
+            "history), WEEKLY -> 1wk candles (5 years), MONTHLY -> 1mo candles (10 years). Only "
+            "completed trading sessions/weeks/months are analysed. Case-insensitive; the former "
+            "names 1_DAY, 1_WEEK and 1_MONTH are still accepted. Cannot be combined with --period "
+            "or --interval. Combine with --as-of to look back to a past date for testing."
         ),
     )
     analyze_parser.add_argument("--lookback-bars", type=int, default=12)
@@ -307,13 +333,17 @@ def _run_analyze(
         raise ConfigurationError("--cache-ttl must be >= 0.")
     if args.data_file and args.mapping_file and identifier.isdigit():
         LOGGER.debug("Numeric identifier will be resolved through the mapping file.")
-    period, interval = _resolve_period_and_interval(args, input_fn=input_fn, interactive=interactive)
+    period, interval, timeframe = _resolve_period_and_interval(
+        args, input_fn=input_fn, interactive=interactive
+    )
     as_of = _parse_as_of(args.as_of)
     LOGGER.debug("Resolved instrument: %s", instrument.to_dict())
+    timeframe_kwargs = {"timeframe": timeframe} if timeframe is not None else {}
     result = analyzer(
         instrument.symbol,
         period=period,
         interval=interval,
+        **timeframe_kwargs,
         as_of=as_of,
         lookback_bars=args.lookback_bars,
         top_pattern_count=args.top,

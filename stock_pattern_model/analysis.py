@@ -2,10 +2,19 @@
 
 from __future__ import annotations
 
+import functools
+import inspect
 from typing import Any
 
 import pandas as pd
 
+from stock_pattern_model.candle_timing import (
+    BAR_END_COLUMN,
+    CandleClock,
+    bar_end_from_frame,
+    candle_span,
+    start_from_bar_end,
+)
 from stock_pattern_model.config import (
     AnalysisConfig,
     MarketDataConfig,
@@ -18,10 +27,10 @@ from stock_pattern_model.context import (
     dataframe_identity,
 )
 from stock_pattern_model.datetime_utils import (
+    candle_display_scope,
     convert_to_timezone,
     format_display_datetime,
     format_iso_timestamp,
-    interval_to_timedelta,
 )
 from stock_pattern_model.domain import (
     DataQualityReport,
@@ -29,7 +38,11 @@ from stock_pattern_model.domain import (
     PatternStatus,
     ResolvedInstrument,
 )
-from stock_pattern_model.exceptions import DataValidationError, NoCompletedBarsError
+from stock_pattern_model.exceptions import (
+    ConfigurationError,
+    DataValidationError,
+    NoCompletedBarsError,
+)
 from stock_pattern_model.features import add_features
 from stock_pattern_model.market_data import (
     FileDataProvider,
@@ -62,6 +75,13 @@ from stock_pattern_model.session_utils import (
     DEFAULT_SESSION_MODE,
     session_date_series,
 )
+from stock_pattern_model.timeframes import (
+    Timeframe,
+    TimeframeSpec,
+    format_lookback_period,
+    get_timeframe_spec,
+    spec_for_interval,
+)
 
 
 def _get_recency_weight(candles_ago: int) -> float:
@@ -75,12 +95,43 @@ def _get_recency_weight(candles_ago: int) -> float:
     return 0.40
 
 
-def _get_bar_timedelta(interval: str) -> pd.Timedelta:
-    return interval_to_timedelta(interval)
+def _resolve_timeframe_spec(
+    interval: str,
+    timeframe: str | Timeframe | None,
+) -> TimeframeSpec | None:
+    """Timeframe spec for this run: the explicit timeframe, else the one implied by the interval."""
+    if timeframe is None:
+        return spec_for_interval(interval)
+    spec = get_timeframe_spec(timeframe)
+    if spec.interval != interval:
+        raise ConfigurationError(
+            f"Timeframe {spec.timeframe.value} uses {spec.interval} candles, "
+            f"but interval='{interval}' was requested."
+        )
+    return spec
 
 
-def _get_bar_end(timestamp: pd.Timestamp, interval: str) -> pd.Timestamp:
-    return timestamp + _get_bar_timedelta(interval)
+def _within_candle_display_scope(function):
+    """Show daily/weekly/monthly candle timestamps as dates for the duration of one analysis."""
+    signature = inspect.signature(function)
+
+    @functools.wraps(function)
+    def wrapper(*args, **kwargs):
+        arguments = signature.bind(*args, **kwargs)
+        arguments.apply_defaults()
+        span = candle_span(str(arguments.arguments.get("interval")))
+        exchange_timezone = arguments.arguments.get("exchange_timezone")
+        if span is not None and exchange_timezone is None:
+            frame = arguments.arguments.get("df")
+            try:
+                detected_zone = pd.to_datetime(frame["Datetime"]).dt.tz
+            except (KeyError, TypeError, ValueError, AttributeError):
+                detected_zone = None
+            exchange_timezone = str(detected_zone) if detected_zone is not None else None
+        with candle_display_scope(span, exchange_timezone):
+            return function(*args, **kwargs)
+
+    return wrapper
 
 
 def _normalize_as_of(as_of: pd.Timestamp | None) -> pd.Timestamp:
@@ -125,13 +176,23 @@ def _filter_completed_candles(
     interval: str,
     as_of: pd.Timestamp | None,
     quality_report: DataQualityReport,
+    clock: CandleClock | None = None,
 ) -> tuple[pd.DataFrame, pd.Timestamp, DataQualityReport]:
+    """Keep only candles that have completed at ``as_of``.
+
+    Daily/weekly/monthly candles complete when the final trading session they cover has closed
+    (exchange calendar, exchange timezone); other intervals complete at ``start + interval``. The
+    completion time stays in the frame as ``Bar_End`` so every later stage (patterns, lifecycle,
+    timestamps) uses the same definition.
+    """
     normalized_as_of = _normalize_as_of(as_of)
     filtered_df = df.copy()
     filtered_df["Datetime"] = pd.to_datetime(filtered_df["Datetime"])
-    filtered_df["Bar_End"] = filtered_df["Datetime"] + _get_bar_timedelta(interval)
-    filtered_df = filtered_df.loc[filtered_df["Bar_End"] <= normalized_as_of].copy()
-    filtered_df = filtered_df.drop(columns=["Bar_End"]).reset_index(drop=True)
+    if not filtered_df.empty:
+        active_clock = clock or CandleClock(interval)
+        filtered_df[BAR_END_COLUMN] = active_clock.bar_ends(filtered_df["Datetime"])
+        filtered_df = filtered_df.loc[filtered_df[BAR_END_COLUMN] <= normalized_as_of].copy()
+    filtered_df = filtered_df.reset_index(drop=True)
 
     if filtered_df.empty:
         raise NoCompletedBarsError(
@@ -151,6 +212,7 @@ def _run_pattern_pipeline(
     exchange_timezone: str | None,
     regular_session_start: str,
     regular_session_end: str,
+    timeframe_spec: TimeframeSpec | None = None,
 ) -> tuple[pd.DataFrame, list[PatternEvent]]:
     pattern_df = classify_intraday_trend(
         add_features(
@@ -163,20 +225,23 @@ def _run_pattern_pipeline(
         pivot_left_bars=config.pattern.pivot_left_bars,
         pivot_right_bars=config.pattern.pivot_right_bars,
         breakout_lookback=config.pattern.breakout_lookback,
+        # Only daily/weekly/monthly runs use strict, timeframe-specific horizons; every other
+        # interval keeps the legacy classifier call unchanged.
+        **({"horizons": timeframe_spec.trend_horizons.as_tuple()} if timeframe_spec is not None else {}),
     )
     pattern_df = classify_local_session_trend(
         pattern_df,
         interval=config.interval,
-        lookback_bars=config.pattern.local_trend_lookback_bars,
+        lookback_bars=(
+            timeframe_spec.local_trend_lookback_bars
+            if timeframe_spec is not None
+            else config.pattern.local_trend_lookback_bars
+        ),
         pivot_left_bars=config.pattern.pivot_left_bars,
         pivot_right_bars=config.pattern.pivot_right_bars,
     )
     pattern_events = detect_patterns(pattern_df, config.pattern, config.interval, registry=registry)
     return pattern_df, pattern_events
-
-
-def _detected_bar_start(pattern: PatternEvent, interval: str) -> pd.Timestamp:
-    return pattern.detected_at - _get_bar_timedelta(interval)
 
 
 def _prepare_pattern_records(
@@ -192,20 +257,24 @@ def _prepare_pattern_records(
         pd.Timestamp(row["Datetime"]).isoformat(): int(index)
         for index, row in df.iterrows()
     }
+    start_by_bar_end = start_from_bar_end(df, interval)
+
+    def bar_start_key(bar_end: pd.Timestamp) -> str | None:
+        start = start_by_bar_end.get(pd.Timestamp(bar_end))
+        return start.isoformat() if start is not None else None
+
     prepared: list[dict[str, Any]] = []
 
     for event in events:
-        detected_bar_key = _detected_bar_start(event, interval).isoformat()
+        detected_bar_key = bar_start_key(event.detected_at)
         final_bar_key = event.bar_start_at.isoformat()
-        setup_completion_key = (
-            event.setup_completion_at - _get_bar_timedelta(interval)
+        setup_completion_key = bar_start_key(
+            event.setup_completion_at
             if event.setup_completion_at is not None
-            else event.pattern_end_at - _get_bar_timedelta(interval)
-        ).isoformat()
+            else event.pattern_end_at
+        )
         confirmation_key = (
-            (event.confirmation_at - _get_bar_timedelta(interval)).isoformat()
-            if event.confirmation_at is not None
-            else None
+            bar_start_key(event.confirmation_at) if event.confirmation_at is not None else None
         )
         detected_index = index_lookup.get(detected_bar_key)
         final_index = index_lookup.get(final_bar_key)
@@ -318,7 +387,7 @@ def _latest_completed_session_info(
     session_mask = session_dates == relevant_session_date
     session_df = df.loc[session_mask].copy().reset_index(drop=True)
     session_start = pd.Timestamp(session_df.iloc[0]["Datetime"])
-    session_end = _get_bar_end(pd.Timestamp(session_df.iloc[-1]["Datetime"]), interval)
+    session_end = bar_end_from_frame(session_df, len(session_df) - 1, interval)
     return {
         "exchange_timezone": exchange_timezone,
         "session_date": relevant_session_date,
@@ -333,12 +402,80 @@ def _latest_completed_session_info(
     }
 
 
+_INSUFFICIENT_TREND_LABEL = "Insufficient Data"
+
+
+def _horizon_score(
+    latest_row: pd.Series,
+    horizon: str,
+    column: str,
+    fallback: float,
+    insufficient_horizons: list[str],
+) -> float | None:
+    """Score of one trend horizon; None when that horizon lacked enough completed candles."""
+    if horizon in insufficient_horizons:
+        return None
+    return round(float(latest_row.get(column, fallback)), 2)
+
+
+def _trend_horizon_warnings(
+    spec: TimeframeSpec | None,
+    insufficient_horizons: list[str],
+    *,
+    available_candles: int,
+) -> list[str]:
+    if spec is None or not insufficient_horizons:
+        return []
+    horizon_candles = {
+        "short": spec.trend_horizons.short,
+        "medium": spec.trend_horizons.medium,
+        "long": spec.trend_horizons.long,
+    }
+    warnings = [
+        f"The {name}-term trend horizon needs {horizon_candles[name]} completed {spec.label.lower()} "
+        f"candles but only {available_candles} were available, so it is reported as "
+        f"{_INSUFFICIENT_TREND_LABEL} and left out of the composite trend."
+        for name in ("short", "medium", "long")
+        if name in insufficient_horizons
+    ]
+    return warnings
+
+
+def _describe_latest_completed_candle(
+    clock: CandleClock,
+    spec: TimeframeSpec | None,
+    latest_start: pd.Timestamp,
+    completed_at: pd.Timestamp,
+) -> dict[str, Any] | None:
+    """Date-based description of the latest completed daily/weekly/monthly candle."""
+    if spec is None or not clock.calendar_based:
+        return None
+    first_day, last_day = clock.trading_dates(latest_start)
+    if spec.candle_span == "session":
+        value = first_day.isoformat()
+        description = f"trading session {value}"
+    elif spec.candle_span == "week":
+        value = f"{first_day.isoformat()} to {last_day.isoformat()}"
+        description = f"trading week {value}"
+    else:
+        value = first_day.strftime("%Y-%m")
+        description = f"trading month {value}"
+    return {
+        "label": spec.completed_candle_label,
+        "value": value,
+        "description": description,
+        "first_trading_date": first_day.isoformat(),
+        "last_trading_date": last_day.isoformat(),
+        "completed_at": format_iso_timestamp(completed_at),
+    }
+
+
 def _exchange_session_date(timestamp: pd.Timestamp, exchange_timezone: str) -> str:
     return pd.Timestamp(timestamp).tz_convert(exchange_timezone).date().isoformat()
 
 
 def _bar_end_for_index(df: pd.DataFrame, index: int, interval: str) -> pd.Timestamp:
-    return _get_bar_end(pd.Timestamp(df.iloc[index]["Datetime"]), interval)
+    return bar_end_from_frame(df, index, interval)
 
 
 def _completion_reference_index(pattern: dict[str, Any]) -> int:
@@ -1029,6 +1166,25 @@ def _pattern_candle_summary(
     }
 
 
+def _event_session_anchor(
+    df: pd.DataFrame,
+    pattern: dict[str, Any],
+    completion_at: pd.Timestamp,
+    interval: str,
+) -> pd.Timestamp:
+    """Timestamp whose exchange date identifies the "session" an event belongs to.
+
+    Intraday events use their completion time. A daily/weekly/monthly candle is its own session,
+    identified by the date its candle starts on (the same date the latest-candle info uses); its
+    completion time can fall on a later date (a weekly candle completes on the week's last
+    session), which would never match.
+    """
+    completion_index = pattern.get("pattern_completion_index")
+    if candle_span(interval) is not None and completion_index is not None:
+        return pd.Timestamp(df.iloc[int(completion_index)]["Datetime"])
+    return completion_at
+
+
 def _build_canonical_event_groups(
     patterns: list[dict[str, Any]],
     *,
@@ -1250,7 +1406,10 @@ def _build_canonical_event_groups(
                 ),
                 "current_score_exclusion_reason": inclusion_reason,
                 "invalidation_condition": invalidation_condition,
-                "session_date": _exchange_session_date(primary_completion, primary["exchange_timezone"]),
+                "session_date": _exchange_session_date(
+                    _event_session_anchor(df, primary, primary_completion, interval),
+                    primary["exchange_timezone"],
+                ),
             }
         )
 
@@ -2028,6 +2187,7 @@ def _collect_history_warnings(
     ]
 
 
+@_within_candle_display_scope
 def analyze_dataframe(
     df: pd.DataFrame,
     symbol: str = "DATAFRAME",
@@ -2047,8 +2207,14 @@ def analyze_dataframe(
     session_mode: str | None = None,
     regular_session_start: str = DEFAULT_REGULAR_SESSION_START,
     regular_session_end: str = DEFAULT_REGULAR_SESSION_END,
+    timeframe: str | Timeframe | None = None,
+    requested_period: str | None = None,
 ) -> dict[str, Any]:
-    """Analyze a prepared OHLCV DataFrame using completed candles only."""
+    """Analyze a prepared OHLCV DataFrame using completed candles only.
+
+    ``timeframe`` (DAILY/WEEKLY/MONTHLY) is optional: daily, weekly, and monthly intervals imply
+    it. ``requested_period`` is only reported in the output (the lookback the data was loaded with).
+    """
     base_config = AnalysisConfig()
     config = AnalysisConfig(
         interval=interval,
@@ -2062,6 +2228,7 @@ def analyze_dataframe(
         timezone=base_config.timezone.__class__(display_timezone=display_timezone),
     )
     config.validate()
+    timeframe_spec = _resolve_timeframe_spec(interval, timeframe)
     display_zone = config.timezone.to_zoneinfo()
     active_registry = registry or DEFAULT_PATTERN_REGISTRY
     provider_name = str((metadata or {}).get("source", "dataframe"))
@@ -2078,6 +2245,12 @@ def analyze_dataframe(
         regular_session_start=regular_session_start,
         regular_session_end=regular_session_end,
         cache_config={"strict_data": strict_data},
+    )
+    clock = CandleClock(
+        interval,
+        exchange_timezone=context.exchange_timezone or exchange_timezone,
+        exchange_calendar=context.exchange_calendar,
+        regular_session_end=context.regular_session_end or regular_session_end,
     )
 
     if validate_data:
@@ -2111,11 +2284,12 @@ def analyze_dataframe(
         interval,
         as_of,
         quality_report,
+        clock,
     )
     context = context.with_runtime_state(
         analysis_time=normalized_as_of,
         latest_completed_candle_start=pd.Timestamp(completed_df.iloc[-1]["Datetime"]),
-        latest_completed_candle_end=_get_bar_end(pd.Timestamp(completed_df.iloc[-1]["Datetime"]), interval),
+        latest_completed_candle_end=bar_end_from_frame(completed_df, len(completed_df) - 1, interval),
         dataframe_identity_value=dataframe_identity(completed_df),
         warnings=list(context.warnings),
     )
@@ -2126,10 +2300,15 @@ def analyze_dataframe(
         exchange_timezone=context.exchange_timezone,
         regular_session_start=context.regular_session_start,
         regular_session_end=context.regular_session_end,
+        timeframe_spec=timeframe_spec,
     )
 
     latest_row = pattern_df.iloc[-1]
     trend = str(latest_row["Trend"])
+    # "Insufficient Data" is reported to the user but carries no directional signal, so scoring
+    # sees it as a neutral trend.
+    scoring_trend = "Neutral" if trend == _INSUFFICIENT_TREND_LABEL else trend
+    insufficient_horizons = [str(name) for name in latest_row.get("Trend_Insufficient_Horizons", [])]
     trend_structure_score = round(float(latest_row.get("Trend_Score", 0.0)), 2)
     trend_evidence = list(latest_row.get("Trend_Evidence", []))
     trend_evidence_structured = list(latest_row.get("Trend_Evidence_Structured", []))
@@ -2169,15 +2348,21 @@ def analyze_dataframe(
         df=pattern_df,
     )
     latest_bar_start_exchange = pd.Timestamp(latest_row["Datetime"])
-    latest_bar_end_exchange = _get_bar_end(latest_bar_start_exchange, interval)
+    latest_bar_end_exchange = bar_end_from_frame(pattern_df, len(pattern_df) - 1, interval)
     latest_bar_start_display = convert_to_timezone(latest_bar_start_exchange, display_zone)
     latest_bar_end_display = convert_to_timezone(latest_bar_end_exchange, display_zone)
     latest_close = round(float(latest_row["Close"]), 2)
     latest_volume_baseline_source = str(latest_row.get("Volume_Baseline_Source", "unknown"))
+    latest_candle_info = _describe_latest_completed_candle(
+        clock,
+        timeframe_spec,
+        latest_bar_start_exchange,
+        latest_bar_end_exchange,
+    )
 
     scoring_result = ScoringService(config.scoring).evaluate(
         symbol=symbol,
-        trend=trend,
+        trend=scoring_trend,
         trend_structure_score=trend_structure_score,
         trend_evidence=trend_evidence,
         trend_evidence_structured=trend_evidence_structured,
@@ -2192,6 +2377,10 @@ def analyze_dataframe(
         latest_bar_end_display=format_display_datetime(latest_bar_end_display, display_zone),
         interval=interval,
         latest_volume_baseline_source=latest_volume_baseline_source,
+        latest_candle_description=(
+            latest_candle_info["description"] if latest_candle_info is not None else None
+        ),
+        local_trend_label="session" if timeframe_spec is None else "window",
     )
     score = scoring_result["score"]
     market_state = scoring_result["market_state"]
@@ -2260,8 +2449,17 @@ def analyze_dataframe(
         for pattern in top_patterns_internal
     ]
 
+    trend_horizon_warnings = _trend_horizon_warnings(
+        timeframe_spec,
+        insufficient_horizons,
+        available_candles=len(completed_df),
+    )
+    if trend_horizon_warnings:
+        explanation += " Trend data note: " + " ".join(trend_horizon_warnings)
     warnings = list(quality_report.warnings)
     warnings.extend(context.warnings)
+    warnings.extend(clock.warnings)
+    warnings.extend(trend_horizon_warnings)
     warnings.extend(_collect_history_warnings(completed_df, active_registry))
     if latest_volume_baseline_source == "rolling_20":
         warnings.append(
@@ -2269,9 +2467,9 @@ def analyze_dataframe(
         )
     warnings.extend(_collect_analysis_validation_warnings(ranked_patterns, score))
 
-    analysis_time_display = format_display_datetime(normalized_as_of, display_zone)
+    analysis_time_display = format_display_datetime(normalized_as_of, display_zone, exact=True)
     exchange_timezone_name = context.exchange_timezone or _get_exchange_timezone(pattern_df)
-    analysis_time_exchange = format_display_datetime(normalized_as_of, exchange_timezone_name)
+    analysis_time_exchange = format_display_datetime(normalized_as_of, exchange_timezone_name, exact=True)
     instrument_payload = context.instrument.to_dict()
     instrument_payload.setdefault("symbol", context.instrument.canonical_symbol)
 
@@ -2299,6 +2497,24 @@ def analyze_dataframe(
         "latest_bar_end_exchange": format_display_datetime(latest_bar_end_exchange, exchange_timezone_name),
         "latest_close": latest_close,
         "interval": interval,
+        "timeframe": timeframe_spec.timeframe.value if timeframe_spec is not None else None,
+        "timeframe_label": timeframe_spec.label if timeframe_spec is not None else None,
+        "candle_interval": interval,
+        "historical_lookback": requested_period,
+        "historical_lookback_display": format_lookback_period(requested_period),
+        "completed_candles_used": len(completed_df),
+        "latest_completed_candle": latest_candle_info,
+        "candle_completion_source": clock.source,
+        "trend_horizon_candles": (
+            {
+                "short": timeframe_spec.trend_horizons.short,
+                "medium": timeframe_spec.trend_horizons.medium,
+                "long": timeframe_spec.trend_horizons.long,
+            }
+            if timeframe_spec is not None
+            else None
+        ),
+        "insufficient_trend_horizons": insufficient_horizons,
         "trend": trend,
         "trend_score": trend_structure_score,
         "trend_signal_score": score["trend_score"],
@@ -2315,9 +2531,9 @@ def analyze_dataframe(
         "short_term_trend": str(latest_row.get("Short_Term_Trend", trend)),
         "medium_term_trend": str(latest_row.get("Medium_Term_Trend", trend)),
         "long_term_trend": str(latest_row.get("Long_Term_Trend", trend)),
-        "short_term_trend_score": round(float(latest_row.get("Short_Term_Trend_Score", trend_structure_score)), 2),
-        "medium_term_trend_score": round(float(latest_row.get("Medium_Term_Trend_Score", trend_structure_score)), 2),
-        "long_term_trend_score": round(float(latest_row.get("Long_Term_Trend_Score", trend_structure_score)), 2),
+        "short_term_trend_score": _horizon_score(latest_row, "short", "Short_Term_Trend_Score", trend_structure_score, insufficient_horizons),
+        "medium_term_trend_score": _horizon_score(latest_row, "medium", "Medium_Term_Trend_Score", trend_structure_score, insufficient_horizons),
+        "long_term_trend_score": _horizon_score(latest_row, "long", "Long_Term_Trend_Score", trend_structure_score, insufficient_horizons),
         "trend_evidence": trend_evidence,
         "trend_evidence_structured": trend_evidence_structured,
         "pattern_score": score["pattern_score"],
@@ -2363,8 +2579,8 @@ def analyze_dataframe(
 
 def analyze_stock(
     symbol: str,
-    period: str = "1mo",
-    interval: str = "15m",
+    period: str | None = None,
+    interval: str | None = None,
     as_of: pd.Timestamp | None = None,
     lookback_bars: int = 12,
     top_pattern_count: int = 3,
@@ -2386,8 +2602,29 @@ def analyze_stock(
     session_mode: str | None = DEFAULT_SESSION_MODE,
     regular_session_start: str = DEFAULT_REGULAR_SESSION_START,
     regular_session_end: str = DEFAULT_REGULAR_SESSION_END,
+    timeframe: str | Timeframe | None = None,
 ) -> dict[str, Any]:
-    """Analyze one symbol using completed intraday candles only."""
+    """Analyze one symbol using completed candles only.
+
+    ``timeframe`` (DAILY / WEEKLY / MONTHLY) selects the candle interval and the historical lookback
+    from ``stock_pattern_model.timeframes``; an explicit ``period`` still overrides the lookback.
+    Without a timeframe the historical defaults apply (``period="1mo"``, ``interval="15m"``).
+    """
+    timeframe_spec = None
+    if timeframe is not None:
+        timeframe_spec = get_timeframe_spec(timeframe)
+        interval = interval or timeframe_spec.interval
+        lookback_was_explicit = (
+            period not in (None, timeframe_spec.lookback_period)
+            or start is not None
+            or end is not None
+            or bool(data_file)
+        )
+        period = period or timeframe_spec.lookback_period
+    else:
+        lookback_was_explicit = True
+        period = period or "1mo"
+        interval = interval or "15m"
     effective_session_mode = session_mode or ("extended" if include_extended_hours else "regular")
     request_context = build_analysis_context(
         symbol=symbol,
@@ -2428,20 +2665,34 @@ def analyze_stock(
                 )
             )
 
-    payload = provider.load(
-        symbol=symbol,
-        interval=interval,
-        period=period,
-        start=start,
-        end=end,
-        exchange_timezone=exchange_timezone,
-        as_of=as_of,
-        strict_data=strict_data,
-        bypass_cache=no_cache,
-        include_extended_hours=request_context.include_extended_hours,
-        session_mode=request_context.session_mode,
-        context=request_context,
-    )
+    def load(requested_period: str):
+        return provider.load(
+            symbol=symbol,
+            interval=interval,
+            period=requested_period,
+            start=start,
+            end=end,
+            exchange_timezone=exchange_timezone,
+            as_of=as_of,
+            strict_data=strict_data,
+            bypass_cache=no_cache,
+            include_extended_hours=request_context.include_extended_hours,
+            session_mode=request_context.session_mode,
+            context=request_context,
+        )
+
+    payload = load(period)
+    if (
+        timeframe_spec is not None
+        and not lookback_was_explicit
+        and timeframe_spec.fallback_lookback_period
+        and timeframe_spec.fallback_lookback_period != period
+        and payload.quality_report.completed_row_count < timeframe_spec.minimum_completed_candles
+    ):
+        # The preferred lookback did not yield enough completed candles for the long trend horizon:
+        # ask the provider for its maximum available history before giving up on that horizon.
+        period = timeframe_spec.fallback_lookback_period
+        payload = load(period)
     return analyze_dataframe(
         df=payload.dataframe,
         symbol=symbol,
@@ -2461,4 +2712,6 @@ def analyze_stock(
         session_mode=request_context.session_mode,
         regular_session_start=request_context.regular_session_start,
         regular_session_end=request_context.regular_session_end,
+        timeframe=timeframe_spec.timeframe if timeframe_spec is not None else None,
+        requested_period=period,
     )

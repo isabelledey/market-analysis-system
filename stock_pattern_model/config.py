@@ -14,6 +14,10 @@ from stock_pattern_model.session_utils import (
     DEFAULT_SESSION_MODE,
     normalize_session_mode,
 )
+from stock_pattern_model.timeframes import (  # noqa: F401
+    SUPPORTED_TIMEFRAMES,
+    TIMEFRAME_TO_PERIOD_INTERVAL,
+)
 
 SUPPORTED_INTERVALS = (
     "1m",
@@ -31,41 +35,8 @@ SUPPORTED_INTERVALS = (
     "3mo",
 )
 
-SUPPORTED_TIMEFRAMES = (
-    "1_DAY",
-    "1_WEEK",
-    "1_MONTH",
-)
-
-# A "timeframe" preset selects the CANDLE SIZE (the bar/aggregation interval), not the total
-# amount of history fetched. The historical lookback ("period") is chosen independently, per
-# candle size, to be large enough to contain many candles -- multi-bar pattern detectors need
-# enough bars for reliable setup/confirmation sequences (see PatternConfig.breakout_lookback,
-# PatternConfig.double_pattern_max_separation_bars, HistoricalEvaluationConfig.minimum_history_bars)
-# well beyond a single unit of the preset's own name.
-#
-# 1_DAY/1_WEEK/1_MONTH use daily/weekly/monthly candles with a lookback expanded to roughly 100+
-# bars of that size (~6 months of daily bars, ~5 years of weekly bars, ~10 years of monthly bars).
-#
-# All three map onto period/interval values yfinance accepts natively for "1d"/"1wk"/"1mo"
-# (unlike short intraday intervals, these carry no provider-side history-window cap), so no local
-# resampling is required.
-TIMEFRAME_TO_INTERVAL: dict[str, str] = {
-    "1_DAY": "1d",
-    "1_WEEK": "1wk",
-    "1_MONTH": "1mo",
-}
-
-TIMEFRAME_TO_LOOKBACK_PERIOD: dict[str, str] = {
-    "1_DAY": "6mo",
-    "1_WEEK": "5y",
-    "1_MONTH": "10y",
-}
-
-TIMEFRAME_TO_PERIOD_INTERVAL: dict[str, tuple[str, str]] = {
-    timeframe: (TIMEFRAME_TO_LOOKBACK_PERIOD[timeframe], TIMEFRAME_TO_INTERVAL[timeframe])
-    for timeframe in SUPPORTED_TIMEFRAMES
-}
+# Timeframe (candle size) settings live in stock_pattern_model.timeframes; these names are
+# re-exported for the CLI and for backward compatibility.
 
 
 @dataclass(frozen=True)
